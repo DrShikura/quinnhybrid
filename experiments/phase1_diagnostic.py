@@ -23,7 +23,7 @@ from data.dataset import PythonCodeDataset, collate_fn
 from training.config import QuINNConfig
 
 
-def evaluate_at_fraction(model, samples, fraction: float, tokenizer, device, batch_size=64):
+def evaluate_at_fraction(model, samples, fraction: float, tokenizer, device, batch_size=64, pass_frac=True):
     """
     Evaluate all samples at exactly `fraction` prefix length.
     Returns dict with accuracy metrics.
@@ -53,11 +53,14 @@ def evaluate_at_fraction(model, samples, fraction: float, tokenizer, device, bat
             prefix_pos[i, :prefix_len] = torch.arange(prefix_len)
             prefix_mask[i, :prefix_len] = True
 
+        frac_tensor = torch.full((batch_size_actual,), fraction) if pass_frac else None
+
         with torch.no_grad():
             _, _, pred_log_len = model(
                 prefix_tokens.to(device),
                 prefix_pos.to(device),
                 prefix_mask.to(device),
+                prefix_frac=frac_tensor.to(device) if frac_tensor is not None else None,
             )
 
         pred_lens = torch.exp(pred_log_len).cpu()

@@ -128,12 +128,15 @@ class QuINN(nn.Module):
         )
 
         # ── Length head ──────────────────────────────────────────────────
-        # Takes |summary| (real magnitudes) + log(prefix_len) → log(seq_len)
-        # log(prefix_len) is critical for monotonicity: without it the model
-        # can't distinguish "I've seen 100 tokens" from "200 tokens" purely
-        # from content features, causing accuracy to peak mid-range and drop.
+        # Takes [|summary|, log(prefix_len), prefix_frac] → log(seq_len).
+        # prefix_frac is the fraction of the file seen (e.g. 0.5 at mid-prefix).
+        # Without it, the model can't distinguish "100 tokens = 10% of file"
+        # from "100 tokens = 90% of file", causing it to predict a slope-based
+        # average that undershoots at 10% and overshoots at 90%.
+        # With it, the model can learn: total ≈ prefix_len / prefix_frac,
+        # and content features refine this baseline estimate.
         self.length_head = nn.Sequential(
-            nn.Linear(manifold_dim + 1, 256),
+            nn.Linear(manifold_dim + 2, 256),
             nn.GELU(),
             nn.Linear(256, 64),
             nn.GELU(),
@@ -188,12 +191,18 @@ class QuINN(nn.Module):
         prefix_mask: torch.Tensor,             # (B, P) bool
         target_tokens: torch.Tensor = None,    # (B, T) long  – full sequence tokens
         target_positions: torch.Tensor = None, # (B, T) long  – full sequence positions
+        prefix_frac: torch.Tensor = None,      # (B,) float – fraction of file seen
     ):
         """
         Returns:
             predicted_waveform:  (B, T, embed_dim) complex  or None
             true_waveform:       (B, T, embed_dim) complex  or None
             pred_log_len:        (B,) float – log of predicted sequence length
+
+        prefix_frac: if provided, included as a feature to the length head so the
+        model can learn total_len ≈ prefix_len / prefix_frac. Without it the model
+        must average over all fractions seen in training, causing systematic bias at
+        extreme fractions. Defaults to 0.5 (mid-range fallback) when not provided.
         """
         summary = self._encode_and_aggregate(prefix_tokens, prefix_positions, prefix_mask)
 
@@ -205,10 +214,15 @@ class QuINN(nn.Module):
             if target_tokens is not None:
                 true_waveform = self._compute_true_waveform(target_tokens, target_positions)
 
-        # Length prediction from summary magnitudes + log(prefix_len)
+        # Length prediction: [|summary|, log(prefix_len), prefix_frac] → log(seq_len)
+        B = prefix_tokens.shape[0]
         log_prefix_len = torch.log(prefix_mask.sum(dim=1).float().clamp(min=1)).unsqueeze(-1)
+        if prefix_frac is None:
+            frac_feat = torch.full((B, 1), 0.5, device=prefix_tokens.device)
+        else:
+            frac_feat = prefix_frac.float().unsqueeze(-1)
         pred_log_len = self.length_head(
-            torch.cat([summary.abs(), log_prefix_len], dim=-1)
+            torch.cat([summary.abs(), log_prefix_len, frac_feat], dim=-1)
         ).squeeze(-1)  # (B,)
 
         return predicted_waveform, true_waveform, pred_log_len

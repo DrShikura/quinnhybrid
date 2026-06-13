@@ -142,6 +142,7 @@ class QuINNTrainer:
             prefix_mask=b["prefix_mask"],
             target_tokens=b["target_tokens"],
             target_positions=b["target_positions"],
+            prefix_frac=b["prefix_frac"],
         )
 
         losses = self.loss_fn(
@@ -220,6 +221,7 @@ class QuINNTrainer:
                 prefix_mask=b["prefix_mask"],
                 target_tokens=b["target_tokens"],
                 target_positions=b["target_positions"],
+                prefix_frac=b["prefix_frac"],
             )
 
             losses = self.loss_fn(pred_wf, true_wf, pred_log_len, b["seq_len"], b["target_mask"])
