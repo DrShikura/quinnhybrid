@@ -214,15 +214,20 @@ class QuINN(nn.Module):
             if target_tokens is not None:
                 true_waveform = self._compute_true_waveform(target_tokens, target_positions)
 
-        # Length prediction: [|summary|, log(prefix_len), prefix_frac] → log(seq_len)
+        # Length prediction: [|summary|, log(prefix_len), log(prefix_frac)] → log(seq_len)
+        # Using log(prefix_frac) rather than prefix_frac makes the target function linear:
+        # log(total_len) = log(prefix_len) - log(prefix_frac) + content_correction
+        # The MLP can learn this with a single weight of -1, making extreme fractions
+        # (0.9, 0.1) as easy as mid-range (0.5). Raw prefix_frac is non-linearly related
+        # to the needed correction (d/dfrac log(1/frac) = -1/frac → steep near 1.0).
         B = prefix_tokens.shape[0]
         log_prefix_len = torch.log(prefix_mask.sum(dim=1).float().clamp(min=1)).unsqueeze(-1)
         if prefix_frac is None:
-            frac_feat = torch.full((B, 1), 0.5, device=prefix_tokens.device)
+            log_frac_feat = torch.full((B, 1), math.log(0.5), device=prefix_tokens.device)
         else:
-            frac_feat = prefix_frac.float().unsqueeze(-1)
+            log_frac_feat = torch.log(prefix_frac.float().clamp(min=1e-6)).unsqueeze(-1)
         pred_log_len = self.length_head(
-            torch.cat([summary.abs(), log_prefix_len, frac_feat], dim=-1)
+            torch.cat([summary.abs(), log_prefix_len, log_frac_feat], dim=-1)
         ).squeeze(-1)  # (B,)
 
         return predicted_waveform, true_waveform, pred_log_len
