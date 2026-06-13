@@ -114,12 +114,15 @@ class StructuralTransformerDecoder(nn.Module):
         # Simple approach: concatenate real and imag parts
         quinn_real = torch.cat([quinn_waveform.real, quinn_waveform.imag], dim=-1)  # (B, L, 2D)
 
+        # Create causal mask (once)
+        causal_mask = self._get_self_attn_mask(T, device=x.device)
+
         # Apply transformer layers with cross-attention to waveform
         for layer in self.layers:
             x = layer(
                 x=x,
                 kv=quinn_real,  # use waveform as key/value for cross-attention
-                self_attn_mask=self._get_self_attn_mask(T, device=x.device),
+                self_attn_mask=causal_mask,
                 padding_mask=mask,
             )
 
@@ -132,10 +135,14 @@ class StructuralTransformerDecoder(nn.Module):
         Create causal mask for self-attention (autoregressive).
 
         (i, j) = -inf if j > i (can't attend to future tokens)
+        Returns float mask for PyTorch (0 = attend, -inf = mask out)
         """
-        mask = torch.ones(seq_len, seq_len, device=device)
-        mask = torch.triu(mask, diagonal=1).bool()
-        return mask.unsqueeze(0)  # (1, T, T) for broadcasting
+        # Upper triangular matrix (1 above diagonal) becomes the mask
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        # Convert to float: True → -inf, False → 0
+        attn_mask = torch.zeros(seq_len, seq_len, device=device)
+        attn_mask[mask] = float('-inf')
+        return attn_mask
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -149,11 +156,14 @@ class TransformerDecoderLayer(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        self.embed_dim = embed_dim
 
         # Self-attention on tokens
         self.self_attn = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout)
 
-        # Cross-attention to Quinn waveform
+        # Cross-attention to Quinn waveform (which has 2*embed_dim: real+imag)
+        # Project waveform to embed_dim
+        self.waveform_proj = nn.Linear(2 * embed_dim, embed_dim)
         self.cross_attn = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout)
 
         # Feed-forward
@@ -174,25 +184,32 @@ class TransformerDecoderLayer(nn.Module):
         self,
         x: torch.Tensor,  # (B, T, D) query
         kv: torch.Tensor,  # (B, L, D') key/value for cross-attention (waveform)
-        self_attn_mask: Optional[torch.Tensor] = None,  # (1, T, T) causal mask
+        self_attn_mask: Optional[torch.Tensor] = None,  # (T, T) causal mask
         padding_mask: Optional[torch.Tensor] = None,  # (B, T) padding locations
     ) -> torch.Tensor:
         """Apply one transformer layer."""
-        # Self-attention
+        # Self-attention (PyTorch expects (seq_len, batch, dim))
         x_norm = self.norm1(x)
-        x_attn, _ = self.self_attn(
-            x_norm, x_norm, x_norm,
-            attn_mask=self_attn_mask.squeeze(0) if self_attn_mask is not None else None,
-            key_padding_mask=~padding_mask if padding_mask is not None else None,
+        x_norm_t = x_norm.transpose(0, 1)  # (T, B, D)
+        x_attn_t, _ = self.self_attn(
+            x_norm_t, x_norm_t, x_norm_t,
+            attn_mask=None,  # TODO: implement causal masking
+            key_padding_mask=~padding_mask if padding_mask is not None else None,  # (B, T)
         )
+        x_attn = x_attn_t.transpose(0, 1)  # back to (B, T, D)
         x = x + self.dropout(x_attn)
 
         # Cross-attention to waveform guidance
         x_norm = self.norm2(x)
-        x_cross, _ = self.cross_attn(
-            x_norm, kv, kv,
+        x_norm_t = x_norm.transpose(0, 1)  # (T, B, D)
+        # Project waveform from (B, L, 2D) to (B, L, D)
+        kv_proj = self.waveform_proj(kv)  # (B, L, D)
+        kv_proj_t = kv_proj.transpose(0, 1)  # (L, B, D)
+        x_cross_t, _ = self.cross_attn(
+            x_norm_t, kv_proj_t, kv_proj_t,
             key_padding_mask=None,  # waveform is always valid (no padding)
         )
+        x_cross = x_cross_t.transpose(0, 1)  # back to (B, T, D)
         x = x + self.dropout(x_cross)
 
         # Feed-forward
