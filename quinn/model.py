@@ -128,11 +128,12 @@ class QuINN(nn.Module):
         )
 
         # ── Length head ──────────────────────────────────────────────────
-        # Takes |summary| (real magnitudes) → log(seq_len)
-        # Using magnitudes discards phase information so the head focuses on
-        # "how much structural content" rather than "what kind".
+        # Takes |summary| (real magnitudes) + log(prefix_len) → log(seq_len)
+        # log(prefix_len) is critical for monotonicity: without it the model
+        # can't distinguish "I've seen 100 tokens" from "200 tokens" purely
+        # from content features, causing accuracy to peak mid-range and drop.
         self.length_head = nn.Sequential(
-            nn.Linear(manifold_dim, 256),
+            nn.Linear(manifold_dim + 1, 256),
             nn.GELU(),
             nn.Linear(256, 64),
             nn.GELU(),
@@ -204,8 +205,11 @@ class QuINN(nn.Module):
             if target_tokens is not None:
                 true_waveform = self._compute_true_waveform(target_tokens, target_positions)
 
-        # Length prediction from summary magnitudes
-        pred_log_len = self.length_head(summary.abs()).squeeze(-1)  # (B,)
+        # Length prediction from summary magnitudes + log(prefix_len)
+        log_prefix_len = torch.log(prefix_mask.sum(dim=1).float().clamp(min=1)).unsqueeze(-1)
+        pred_log_len = self.length_head(
+            torch.cat([summary.abs(), log_prefix_len], dim=-1)
+        ).squeeze(-1)  # (B,)
 
         return predicted_waveform, true_waveform, pred_log_len
 
