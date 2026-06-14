@@ -55,6 +55,8 @@ def main():
     parser.add_argument('--top-p',      type=float, default=0.95)
     parser.add_argument('--beam',       action='store_true')
     parser.add_argument('--n-beams',    type=int,   default=4)
+    parser.add_argument('--verbose',    action='store_true',
+                        help='Print top-5 predictions at each generation step')
     args = parser.parse_args()
 
     model, tokenizer, config = load_from_checkpoint(args.checkpoint)
@@ -77,6 +79,7 @@ def main():
             temperature = args.temperature,
             top_k       = args.top_k,
             top_p       = args.top_p,
+            verbose     = args.verbose,
         )
 
     print(result)

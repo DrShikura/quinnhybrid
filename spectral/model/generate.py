@@ -52,6 +52,7 @@ def generate(
     top_p:       float = 0.95,
     stop_on_eos: bool = True,
     device:      str  = 'cpu',
+    verbose:     bool = False,
 ) -> str:
     """
     Generate tokens autoregressively from a prompt.
@@ -82,7 +83,13 @@ def generate(
 
     generated = list(token_ids)
 
-    for _ in range(max_new):
+    if verbose:
+        prompt_tokens = [tokenizer.vocab[i] for i in token_ids]
+        print(f"Prompt tokens ({len(token_ids)}): {prompt_tokens}")
+        print(f"{'Step':<5} {'Predicted':<20} {'Prob':>6}  Top-5")
+        print("-" * 70)
+
+    for step in range(max_new):
         # Truncate to model's max_seq_len
         ctx = generated[-model.embedding.max_seq_len:]
 
@@ -94,6 +101,7 @@ def generate(
         logits = out['lm_logits'][0, -1, :]     # (vocab_size,) last position
 
         # Apply temperature
+        raw_probs = F.softmax(logits, dim=-1)   # before temp/filter, for verbose
         if temperature > 0:
             logits = logits / temperature
             logits = _top_k_top_p_filter(logits, top_k=top_k, top_p=top_p)
@@ -101,6 +109,15 @@ def generate(
             next_id = torch.multinomial(probs, num_samples=1).item()
         else:
             next_id = logits.argmax().item()
+
+        if verbose:
+            top5_p, top5_i = raw_probs.topk(5)
+            top5 = [(tokenizer.vocab[i], f"{p:.3f}")
+                    for i, p in zip(top5_i.tolist(), top5_p.tolist())]
+            chosen = tokenizer.vocab[next_id]
+            chosen_p = raw_probs[next_id].item()
+            top5_str = "  ".join(f"{t}({p})" for t, p in top5)
+            print(f"{step:<5} {chosen:<20} {chosen_p:>6.3f}  {top5_str}")
 
         generated.append(next_id)
 
