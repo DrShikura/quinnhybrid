@@ -78,6 +78,12 @@ def generate(
     # Encode prompt
     if prompt.strip():
         token_ids = tokenizer.encode(prompt, add_special=True)
+        # Python's tokenizer always appends NEWLINE+ENDMARKER to any input,
+        # even incomplete snippets like "def ". Strip those file terminators so
+        # the model sees the prefix we actually want to continue, not a closed file.
+        _TERMINALS = {'<EOS>', 'ENDMARKER', 'NEWLINE', 'NL'}
+        while len(token_ids) > 1 and tokenizer.vocab[token_ids[-1]] in _TERMINALS:
+            token_ids = token_ids[:-1]
     else:
         token_ids = [tokenizer.bos_id]
 
@@ -148,6 +154,9 @@ def generate_beam(
 
     if prompt.strip():
         token_ids = tokenizer.encode(prompt, add_special=True)
+        _TERMINALS = {'<EOS>', 'ENDMARKER', 'NEWLINE', 'NL'}
+        while len(token_ids) > 1 and tokenizer.vocab[token_ids[-1]] in _TERMINALS:
+            token_ids = token_ids[:-1]
     else:
         token_ids = [tokenizer.bos_id]
 

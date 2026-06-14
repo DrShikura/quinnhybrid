@@ -61,20 +61,24 @@ def main():
 
     model, tokenizer, config = load_from_checkpoint(args.checkpoint)
 
-    print(f"\nPrompt: {repr(args.prompt)}")
+    # Interpret common escape sequences so --prompt "import os\ndef " works
+    # on Windows where the shell passes \n as a literal backslash-n.
+    prompt = args.prompt.replace('\\n', '\n').replace('\\t', '\t')
+
+    print(f"\nPrompt: {repr(prompt)}")
     print("-" * 50)
 
     if args.beam:
         result = generate_beam(
             model, tokenizer,
-            prompt   = args.prompt,
+            prompt   = prompt,
             max_new  = args.max_new,
             n_beams  = args.n_beams,
         )
     else:
         result = generate(
             model, tokenizer,
-            prompt      = args.prompt,
+            prompt      = prompt,
             max_new     = args.max_new,
             temperature = args.temperature,
             top_k       = args.top_k,
