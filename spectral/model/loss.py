@@ -112,6 +112,47 @@ class BandedWaveformLoss(nn.Module):
         return losses
 
 
+class WaveformGradientLoss(nn.Module):
+    """
+    Gradient consistency loss.
+
+    Computes the gradient of max-logit w.r.t. the input embedding at each
+    position, then measures cosine similarity between adjacent positions'
+    gradient directions. High consistency → the model uses the same spectral
+    features for prediction regardless of position, confirming position-invariant
+    frequency representations.
+
+    Loss = 1 − mean_t(cosine_sim(∇_t, ∇_{t+1}))
+    Range [0, 2]; target is 0 (perfectly consistent).
+    Only computed during training (requires active autograd graph).
+    """
+
+    def forward(
+        self,
+        embedding: torch.Tensor,           # (B, T, 2D) input waveform, in graph
+        lm_logits: torch.Tensor,           # (B, T, vocab)
+        pad_mask: torch.Tensor | None = None,  # (B, T) float, 1=valid
+    ) -> torch.Tensor:
+        max_logit_vals = lm_logits.max(dim=-1).values   # (B, T)
+
+        grad = torch.autograd.grad(
+            outputs=max_logit_vals.sum(),
+            inputs=embedding,
+            create_graph=True,
+        )[0]   # (B, T, 2D)
+
+        grad_norm = F.normalize(grad, dim=-1)   # (B, T, 2D)
+        cos_sim = (grad_norm[:, :-1] * grad_norm[:, 1:]).sum(dim=-1)   # (B, T-1)
+
+        if pad_mask is not None:
+            mask = pad_mask[:, :-1] * pad_mask[:, 1:]
+            loss = 1.0 - (cos_sim * mask).sum() / (mask.sum() + 1e-8)
+        else:
+            loss = 1.0 - cos_sim.mean()
+
+        return loss
+
+
 class SpectralLoss(nn.Module):
     """
     Combined loss for SpectralLM.
@@ -123,6 +164,7 @@ class SpectralLoss(nn.Module):
         lm_weight:        weight on language model loss
         waveform_weight:  weight on waveform completion loss
         band_weights:     per-band waveform loss weights
+        gradient_weight:  weight on gradient consistency loss (0 to disable)
     """
 
     def __init__(
@@ -133,14 +175,17 @@ class SpectralLoss(nn.Module):
         lm_weight:        float = 1.0,
         waveform_weight:  float = 0.5,
         band_weights:     tuple = (1.5, 1.0, 0.5),
+        gradient_weight:  float = 0.1,
     ):
         super().__init__()
         self.lm_weight       = lm_weight
         self.waveform_weight = waveform_weight
+        self.gradient_weight = gradient_weight
 
-        self.waveform_loss = BandedWaveformLoss(
+        self.waveform_loss  = BandedWaveformLoss(
             embed_dim, structural_end, expr_end, band_weights
         )
+        self.gradient_loss  = WaveformGradientLoss()
 
     def forward(
         self,
@@ -180,6 +225,22 @@ class SpectralLoss(nn.Module):
                                               mask=pad_mask[:, 1:])
             losses.update({f'wave_{k}': v for k, v in wave_losses.items()})
             total = total + self.waveform_weight * wave_losses['total']
+
+        # Gradient consistency loss — only when training (autograd graph is live)
+        # and the embedding is available in model_out.
+        if (mode in ('lm', 'joint')
+                and self.gradient_weight > 0
+                and torch.is_grad_enabled()
+                and 'embedding' in model_out
+                and 'lm_logits' in model_out):
+            pad_mask = (target_ids != pad_id).float()
+            grad_loss = self.gradient_loss(
+                embedding=model_out['embedding'],
+                lm_logits=model_out['lm_logits'],
+                pad_mask=pad_mask,
+            )
+            losses['grad'] = grad_loss
+            total = total + self.gradient_weight * grad_loss
 
         losses['total'] = total
         return losses

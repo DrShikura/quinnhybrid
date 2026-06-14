@@ -87,14 +87,15 @@ class SpectralLM(nn.Module):
 
     def __init__(
         self,
-        vocab:        list,
-        embed_dim:    int = 64,
-        n_layers:     int = 4,
-        n_heads:      int = 8,
-        max_seq_len:  int = 512,
-        dropout:      float = 0.1,
-        band_init:    bool = True,
-        acoustic_init: bool = True,
+        vocab:             list,
+        embed_dim:         int = 64,
+        n_layers:          int = 4,
+        n_heads:           int = 8,
+        max_seq_len:       int = 512,
+        dropout:           float = 0.1,
+        band_init:         bool = True,
+        acoustic_init:     bool = True,
+        transition_matrix: 'torch.Tensor | None' = None,
     ):
         super().__init__()
 
@@ -107,12 +108,13 @@ class SpectralLM(nn.Module):
 
         # ── Embedding ────────────────────────────────────────────────────────
         self.embedding = SpectralEmbedding(
-            vocab_size    = self.vocab_size,
-            embed_dim     = embed_dim,
-            max_seq_len   = max_seq_len,
-            vocab         = vocab,
-            band_init     = band_init,
-            acoustic_init = acoustic_init,
+            vocab_size        = self.vocab_size,
+            embed_dim         = embed_dim,
+            max_seq_len       = max_seq_len,
+            vocab             = vocab,
+            band_init         = band_init,
+            acoustic_init     = acoustic_init,
+            transition_matrix = transition_matrix,
         )
 
         # ── Transformer ──────────────────────────────────────────────────────
@@ -163,8 +165,10 @@ class SpectralLM(nn.Module):
         B, T = tokens.shape
 
         # Spectral embedding: (B, T, 2*embed_dim)
+        # Kept in computation graph (not detached) so WaveformGradientLoss can
+        # differentiate max-logit w.r.t. each embedding dimension.
         x = self.embedding(tokens, positions)
-        input_waveform = x.detach()   # save for waveform completion target
+        embedding_out = x
 
         # Causal Transformer
         causal_mask = self._causal_mask(T, tokens.device)
@@ -172,7 +176,7 @@ class SpectralLM(nn.Module):
             x = layer(x, causal_mask)
         x = self.norm(x)
 
-        out = {'hidden': x, 'embedding': input_waveform}
+        out = {'hidden': x, 'embedding': embedding_out}
 
         if mode in ('lm', 'joint'):
             out['lm_logits'] = self.lm_head(x)         # (B, T, vocab)

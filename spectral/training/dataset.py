@@ -17,6 +17,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from data.tokenizer import PythonStructuralTokenizer
 
 
+def compute_transition_matrix(samples: List[List[int]], vocab_size: int) -> torch.Tensor:
+    """Row-normalized bigram transition probability matrix from tokenized sequences."""
+    counts = torch.zeros(vocab_size, vocab_size)
+    for seq in samples:
+        for i in range(len(seq) - 1):
+            counts[seq[i], seq[i + 1]] += 1.0
+    row_sums = counts.sum(dim=1, keepdim=True).clamp(min=1.0)
+    return counts / row_sums
+
+
 class SpectralDataset(Dataset):
     """
     Loads Python source files and returns full token sequences.
@@ -79,6 +89,10 @@ class SpectralDataset(Dataset):
                     all_samples.append(ids)
             except Exception:
                 pass
+
+        # Bigram transition matrix from the full corpus (before any split)
+        vocab_size = len(self.tokenizer.vocab)
+        self.transition_matrix = compute_transition_matrix(all_samples, vocab_size)
 
         # Reproducible split
         rng = random.Random(seed)

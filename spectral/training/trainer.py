@@ -20,16 +20,18 @@ from ..model.spectral_lm import SpectralLM
 from ..model.loss import SpectralLoss
 
 
-def build_model(config: dict, vocab: list) -> SpectralLM:
+def build_model(config: dict, vocab: list,
+                transition_matrix=None) -> SpectralLM:
     return SpectralLM(
-        vocab         = vocab,
-        embed_dim     = config.get('embed_dim',     64),
-        n_layers      = config.get('n_layers',       4),
-        n_heads       = config.get('n_heads',        8),
-        max_seq_len   = config.get('max_seq_len',  512),
-        dropout       = config.get('dropout',      0.1),
-        band_init     = config.get('band_init',    True),
-        acoustic_init = config.get('acoustic_init', True),
+        vocab              = vocab,
+        embed_dim          = config.get('embed_dim',     64),
+        n_layers           = config.get('n_layers',       4),
+        n_heads            = config.get('n_heads',        8),
+        max_seq_len        = config.get('max_seq_len',  512),
+        dropout            = config.get('dropout',      0.1),
+        band_init          = config.get('band_init',    True),
+        acoustic_init      = config.get('acoustic_init', True),
+        transition_matrix  = transition_matrix,
     )
 
 
@@ -75,6 +77,7 @@ class SpectralTrainer:
             lm_weight       = config.get('lm_weight',       1.0),
             waveform_weight = config.get('waveform_weight', 0.5),
             band_weights    = tuple(config.get('band_weights', [1.5, 1.0, 0.5])),
+            gradient_weight = config.get('gradient_weight', 0.1),
         )
 
         # Optimizer with warmup + cosine decay
@@ -122,11 +125,23 @@ class SpectralTrainer:
         # cosine (default)
         return base_w * 0.5 * (1.0 + math.cos(math.pi * progress))
 
+    def _grad_weight(self, epoch: int) -> float:
+        """Gradient consistency loss weight — same cosine schedule as waveform."""
+        base_w   = self.config.get('gradient_weight', 0.1)
+        schedule = self.config.get('wave_schedule', 'cosine')
+        if schedule == 'none':
+            return base_w
+        progress = (epoch - 1) / max(self.n_epochs - 1, 1)
+        if schedule == 'linear':
+            return base_w * max(0.0, 1.0 - progress)
+        return base_w * 0.5 * (1.0 + math.cos(math.pi * progress))
+
     def _run_epoch(self, loader: DataLoader, train: bool) -> dict:
         self.model.train(train)
         total_loss = 0.0
         total_lm   = 0.0
         total_wave = 0.0
+        total_grad = 0.0
         n_steps    = 0
 
         with torch.set_grad_enabled(train):
@@ -148,7 +163,7 @@ class SpectralTrainer:
                 else:
                     full_wave = None
 
-                # Loss
+                # Loss (gradient consistency loss computed inside criterion when training)
                 losses = self.criterion(
                     model_out   = out,
                     target_ids  = token_ids,
@@ -165,14 +180,16 @@ class SpectralTrainer:
                     self.scheduler.step()
 
                 total_loss += losses['total'].item()
-                if 'lm'          in losses: total_lm   += losses['lm'].item()
-                if 'wave_total'  in losses: total_wave += losses['wave_total'].item()
+                if 'lm'         in losses: total_lm   += losses['lm'].item()
+                if 'wave_total' in losses: total_wave += losses['wave_total'].item()
+                if 'grad'       in losses: total_grad += losses['grad'].item()
                 n_steps += 1
 
         return {
             'loss':       total_loss / max(n_steps, 1),
             'lm_loss':    total_lm   / max(n_steps, 1),
             'wave_loss':  total_wave / max(n_steps, 1),
+            'grad_loss':  total_grad / max(n_steps, 1),
         }
 
     def train(self):
@@ -196,8 +213,9 @@ class SpectralTrainer:
         t0 = time.time()
 
         for epoch in range(start_epoch, self.n_epochs + 1):
-            # Update wave weight according to schedule
+            # Update annealed loss weights
             self.criterion.waveform_weight = self._wave_weight(epoch)
+            self.criterion.gradient_weight = self._grad_weight(epoch)
 
             train_metrics = self._run_epoch(self.train_dl, train=True)
             val_metrics   = self._run_epoch(self.val_dl,   train=False)
@@ -206,14 +224,18 @@ class SpectralTrainer:
             lr_now  = self.scheduler.get_last_lr()[0]
 
             wave_w = self.criterion.waveform_weight
+            grad_w = self.criterion.gradient_weight
             print(f"\nEpoch {epoch}/{self.n_epochs}  "
-                  f"lr={lr_now:.2e}  wave_w={wave_w:.3f}  elapsed={elapsed:.0f}s")
+                  f"lr={lr_now:.2e}  wave_w={wave_w:.3f}  grad_w={grad_w:.3f}  "
+                  f"elapsed={elapsed:.0f}s")
             print(f"  Train — loss={train_metrics['loss']:.4f}  "
                   f"lm={train_metrics['lm_loss']:.4f}  "
-                  f"wave={train_metrics['wave_loss']:.4f}")
+                  f"wave={train_metrics['wave_loss']:.4f}  "
+                  f"grad={train_metrics['grad_loss']:.4f}")
             print(f"  Val   — loss={val_metrics['loss']:.4f}  "
                   f"lm={val_metrics['lm_loss']:.4f}  "
-                  f"wave={val_metrics['wave_loss']:.4f}")
+                  f"wave={val_metrics['wave_loss']:.4f}  "
+                  f"grad={val_metrics['grad_loss']:.4f}")
 
             record = {
                 'epoch': epoch,

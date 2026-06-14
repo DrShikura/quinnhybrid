@@ -43,6 +43,10 @@ def main():
                              'instead of banded — tests whether structure self-organizes')
     parser.add_argument('--no-acoustic-init', action='store_true',
                         help='Random amplitude init instead of character acoustic profiles')
+    parser.add_argument('--no-bigram-init',  action='store_true',
+                        help='Skip bigram SVD amplitude init (falls back to acoustic or random)')
+    parser.add_argument('--gradient-weight', type=float, default=0.1,
+                        help='Weight for gradient consistency loss (0 to disable)')
     parser.add_argument('--corpus',      default='data/corpus.txt',
                         help='.txt file with one Python file path per line')
     parser.add_argument('--corpus-dir',  default=None,
@@ -74,6 +78,8 @@ def main():
             'wave_schedule':   args.wave_schedule,
             'band_init':       not args.no_band_init,
             'acoustic_init':   not args.no_acoustic_init,
+            'bigram_init':     not args.no_bigram_init,
+            'gradient_weight': args.gradient_weight,
             'band_weights':    [1.5, 1.0, 0.5],
             'weight_decay':    0.01,
         }
@@ -96,8 +102,14 @@ def main():
     val_dl   = DataLoader(val_ds,   batch_size=args.batch_size,
                            shuffle=False, collate_fn=collate, num_workers=0)
 
+    # Use bigram SVD init unless --no-bigram-init is set (or we're resuming,
+    # in which case weights are overwritten by the checkpoint anyway).
+    use_bigram = config.get('bigram_init', True)
+    transition_matrix = train_ds.transition_matrix if use_bigram else None
+
     print("\nBuilding SpectralLM...")
-    model = build_model(config, tokenizer.vocab)
+    model = build_model(config, tokenizer.vocab,
+                        transition_matrix=transition_matrix)
 
     trainer = SpectralTrainer(
         model          = model,

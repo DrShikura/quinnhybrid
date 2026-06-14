@@ -31,6 +31,34 @@ import torch
 import torch.nn as nn
 
 
+# ── Bigram eigenvector initialization ─────────────────────────────────────────
+
+def eigenvector_spectral_profile(
+    transition_matrix: torch.Tensor,
+    vocab_size: int,
+    embed_dim: int,
+) -> torch.Tensor:
+    """
+    Initialize token amplitude profiles from the top-K left singular vectors of
+    the row-normalized bigram transition probability matrix.
+
+    Tokens that appear in similar predictive contexts (high co-occurrence overlap)
+    will receive similar spectral fingerprints, seeding the embedding with
+    corpus-derived structure before any gradient updates.
+
+    Returns (vocab_size, embed_dim) float tensor scaled to 0.02 magnitude.
+    """
+    P = transition_matrix.float()   # (vocab_size, vocab_size)
+    U, _S, _Vh = torch.linalg.svd(P, full_matrices=False)
+    # U: (vocab_size, min(V, V)) — left singular vectors
+    k = min(embed_dim, U.shape[1])
+    top_U = U[:, :k]               # (vocab_size, k)
+    if k < embed_dim:
+        # Shouldn't happen for 74-token vocab with embed_dim<=32, but be safe
+        top_U = torch.cat([top_U, torch.zeros(vocab_size, embed_dim - k)], dim=1)
+    return top_U * 0.02
+
+
 # ── Character acoustic classes ─────────────────────────────────────────────────
 
 _VOWELS      = set("aeiouAEIOU")
@@ -116,8 +144,16 @@ class SpectralEmbedding(nn.Module):
     STRUCTURAL_FRAC = 0.25
     EXPR_FRAC       = 0.50
 
-    def __init__(self, vocab_size: int, embed_dim: int, max_seq_len: int,
-                 vocab: list, band_init: bool = True, acoustic_init: bool = True):
+    def __init__(
+        self,
+        vocab_size: int,
+        embed_dim: int,
+        max_seq_len: int,
+        vocab: list,
+        band_init: bool = True,
+        acoustic_init: bool = True,
+        transition_matrix: torch.Tensor | None = None,
+    ):
         super().__init__()
         self.vocab_size  = vocab_size
         self.embed_dim   = embed_dim
@@ -128,12 +164,26 @@ class SpectralEmbedding(nn.Module):
                                   int(embed_dim * self.EXPR_FRAC))
 
         self.amplitude = nn.Embedding(vocab_size, embed_dim)
-        if acoustic_init:
+        if transition_matrix is not None:
+            # Bigram SVD init: co-occurrence structure as amplitude fingerprints
+            with torch.no_grad():
+                self.amplitude.weight.copy_(
+                    eigenvector_spectral_profile(transition_matrix, vocab_size, embed_dim)
+                )
+        elif acoustic_init:
             self._init_amplitudes(vocab)
 
         self.freq = nn.Parameter(
             self._init_frequencies_banded() if band_init
             else torch.rand(embed_dim) * 0.48 + 0.02
+        )
+
+        # log_sigma: learned locality scale per dimension (not used in forward).
+        # Kept for inspection: large σ = global (structural), small σ = local (semantic).
+        # Will be re-introduced as an attention bias when the design is ready.
+        self.log_sigma = nn.Parameter(
+            self._init_log_sigma_banded() if band_init
+            else torch.zeros(embed_dim)
         )
 
     def _init_amplitudes(self, vocab: list):
@@ -144,6 +194,14 @@ class SpectralEmbedding(nn.Module):
                     self.structural_end, self.expr_end
                 )
                 self.amplitude.weight[idx] = profile
+
+    def _init_log_sigma_banded(self) -> torch.Tensor:
+        """Band-based locality scale init: structural=global, semantic=local."""
+        log_sigma = torch.zeros(self.embed_dim)
+        log_sigma[:self.structural_end] = math.log(max(self.max_seq_len / 4,  1.0))
+        log_sigma[self.structural_end:self.expr_end] = math.log(max(self.max_seq_len / 16, 1.0))
+        log_sigma[self.expr_end:] = math.log(max(self.max_seq_len / 64, 1.0))
+        return log_sigma
 
     def _init_frequencies_banded(self) -> torch.Tensor:
         """Partition frequency range into three bands by dim index."""
