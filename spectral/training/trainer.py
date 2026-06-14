@@ -5,6 +5,10 @@ Supports three training modes:
     waveform:  pre-train on waveform completion (learns frequency structure)
     lm:        train on next-token prediction only
     joint:     both losses — waveform as regularizer, LM as primary objective
+
+Loss schedule:
+    waveform_weight: cosine-annealed from base → 0 over training epochs
+    gradient_weight: CONSTANT throughout (frozen entropy target never changes)
 """
 
 import json
@@ -21,7 +25,7 @@ from ..model.loss import SpectralLoss
 
 
 def build_model(config: dict, vocab: list,
-                transition_matrix=None) -> SpectralLM:
+                laplacian_eigvecs=None) -> SpectralLM:
     return SpectralLM(
         vocab              = vocab,
         embed_dim          = config.get('embed_dim',     64),
@@ -31,7 +35,7 @@ def build_model(config: dict, vocab: list,
         dropout            = config.get('dropout',      0.1),
         band_init          = config.get('band_init',    True),
         acoustic_init      = config.get('acoustic_init', True),
-        transition_matrix  = transition_matrix,
+        laplacian_eigvecs  = laplacian_eigvecs,
     )
 
 
@@ -40,11 +44,15 @@ class SpectralTrainer:
     Trainer for SpectralLM.
 
     Args:
-        model:         SpectralLM instance
-        train_loader:  DataLoader yielding (token_ids, position_ids) batches
-        val_loader:    DataLoader for validation
-        config:        training configuration dict
+        model:          SpectralLM instance
+        train_loader:   DataLoader yielding (token_ids, position_ids) batches
+        val_loader:     DataLoader for validation
+        config:         training configuration dict
         checkpoint_dir: where to save checkpoints
+        tokenizer:      for pad_id
+        frozen_entropy: (vocab_size,) H_norm from SpectralDataset — passed to
+                        WaveformGradientConsistencyLoss each step; if None, that
+                        loss is disabled
     """
 
     def __init__(
@@ -55,6 +63,7 @@ class SpectralTrainer:
         config:         dict,
         checkpoint_dir: str | Path,
         tokenizer,
+        frozen_entropy: 'torch.Tensor | None' = None,
     ):
         self.model    = model
         self.train_dl = train_loader
@@ -64,20 +73,26 @@ class SpectralTrainer:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.tokenizer = tokenizer
 
-        self.mode    = config.get('mode', 'joint')
-        self.device  = torch.device('cpu')
+        self.mode   = config.get('mode', 'joint')
+        self.device = torch.device('cpu')
         self.model.to(self.device)
+
+        # Frozen entropy tensor on same device
+        self.frozen_entropy = (
+            frozen_entropy.to(self.device) if frozen_entropy is not None else None
+        )
 
         # Loss
         emb = model.embedding
         self.criterion = SpectralLoss(
-            embed_dim       = model.embed_dim,
-            structural_end  = emb.structural_end,
-            expr_end        = emb.expr_end,
-            lm_weight       = config.get('lm_weight',       1.0),
-            waveform_weight = config.get('waveform_weight', 0.5),
-            band_weights    = tuple(config.get('band_weights', [1.5, 1.0, 0.5])),
-            gradient_weight = config.get('gradient_weight', 0.1),
+            embed_dim         = model.embed_dim,
+            structural_end    = emb.structural_end,
+            expr_end          = emb.expr_end,
+            lm_weight         = config.get('lm_weight',        1.0),
+            waveform_weight   = config.get('waveform_weight',  0.5),
+            band_weights      = tuple(config.get('band_weights', [1.5, 1.0, 0.5])),
+            gradient_weight   = config.get('gradient_weight',  0.1),
+            entropy_threshold = config.get('entropy_threshold', 0.4),
         )
 
         # Optimizer with warmup + cosine decay
@@ -101,7 +116,6 @@ class SpectralTrainer:
                 anneal_strategy = 'cos',
             )
         else:
-            # OneCycleLR divides by zero with very few steps; use cosine fallback
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=max(total_steps, 1), eta_min=self.lr * 0.01
             )
@@ -109,25 +123,8 @@ class SpectralTrainer:
         self.history = []
 
     def _wave_weight(self, epoch: int) -> float:
-        """Return scheduled wave weight for this epoch.
-
-        'cosine': base_weight * (1 + cos(π * t)) / 2  — full at epoch 1, 0 at end
-        'linear': linearly decays to 0
-        'none':   constant (original behaviour)
-        """
+        """Cosine-anneal waveform loss weight: full at epoch 1, zero at end."""
         base_w   = self.config.get('waveform_weight', 0.5)
-        schedule = self.config.get('wave_schedule', 'cosine')
-        if schedule == 'none':
-            return base_w
-        progress = (epoch - 1) / max(self.n_epochs - 1, 1)  # 0 → 1
-        if schedule == 'linear':
-            return base_w * max(0.0, 1.0 - progress)
-        # cosine (default)
-        return base_w * 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    def _grad_weight(self, epoch: int) -> float:
-        """Gradient consistency loss weight — same cosine schedule as waveform."""
-        base_w   = self.config.get('gradient_weight', 0.1)
         schedule = self.config.get('wave_schedule', 'cosine')
         if schedule == 'none':
             return base_w
@@ -138,10 +135,7 @@ class SpectralTrainer:
 
     def _run_epoch(self, loader: DataLoader, train: bool) -> dict:
         self.model.train(train)
-        total_loss = 0.0
-        total_lm   = 0.0
-        total_wave = 0.0
-        total_grad = 0.0
+        total_loss = total_lm = total_wave = total_grad = 0.0
         n_steps    = 0
 
         with torch.set_grad_enabled(train):
@@ -150,26 +144,22 @@ class SpectralTrainer:
                 token_ids    = token_ids.to(self.device)
                 position_ids = position_ids.to(self.device)
 
-                # Forward
                 out = self.model(token_ids, position_ids, mode=self.mode)
 
-                # Waveform target: amplitude vector of each token (embed_dim, not 2D).
-                # Predicting the full waveform after cosine-normalization degenerates to
-                # phase prediction (trivially solved by phase advance). Amplitude-only
-                # target requires token identity prediction, which is the intended task.
+                # Amplitude target (D-dim, not 2D) avoids phase-prediction degeneracy
                 if self.mode in ('waveform', 'joint'):
                     with torch.no_grad():
                         full_wave = self.model.embedding.amplitude(token_ids)
                 else:
                     full_wave = None
 
-                # Loss (gradient consistency loss computed inside criterion when training)
                 losses = self.criterion(
-                    model_out   = out,
-                    target_ids  = token_ids,
-                    target_wave = full_wave,
-                    pad_id      = self.tokenizer.pad_id,
-                    mode        = self.mode,
+                    model_out      = out,
+                    target_ids     = token_ids,
+                    target_wave    = full_wave,
+                    frozen_entropy = self.frozen_entropy,
+                    pad_id         = self.tokenizer.pad_id,
+                    mode           = self.mode,
                 )
 
                 if train:
@@ -186,10 +176,10 @@ class SpectralTrainer:
                 n_steps += 1
 
         return {
-            'loss':       total_loss / max(n_steps, 1),
-            'lm_loss':    total_lm   / max(n_steps, 1),
-            'wave_loss':  total_wave / max(n_steps, 1),
-            'grad_loss':  total_grad / max(n_steps, 1),
+            'loss':      total_loss / max(n_steps, 1),
+            'lm_loss':   total_lm   / max(n_steps, 1),
+            'wave_loss': total_wave / max(n_steps, 1),
+            'grad_loss': total_grad / max(n_steps, 1),
         }
 
     def train(self):
@@ -199,35 +189,31 @@ class SpectralTrainer:
         print(f"  Transformer: {counts['transformer']:,}")
         print(f"  Heads:       {counts['heads']:,}")
         print(f"\nMode: {self.mode}   Epochs: {self.n_epochs}")
-        print(f"Structural band: dims 0-{self.model.embedding.structural_end}")
-        print(f"Expression band: dims {self.model.embedding.structural_end}-{self.model.embedding.expr_end}")
-        print(f"Semantic band:   dims {self.model.embedding.expr_end}-{self.model.embed_dim}")
+        emb = self.model.embedding
+        print(f"Structural band: dims 0-{emb.structural_end}")
+        print(f"Expression band: dims {emb.structural_end}-{emb.expr_end}")
+        print(f"Semantic band:   dims {emb.expr_end}-{self.model.embed_dim}")
+        grad_w = self.criterion.gradient_weight
+        print(f"Gradient consistency loss weight: {grad_w:.3f} (constant)")
         print("=" * 60)
 
         start_epoch = getattr(self, '_start_epoch', 1)
-        # Restore best_val from history if resuming
-        if self.history:
-            best_val = min(r['val']['loss'] for r in self.history)
-        else:
-            best_val = float('inf')
+        best_val    = min((r['val']['loss'] for r in self.history), default=float('inf'))
         t0 = time.time()
 
         for epoch in range(start_epoch, self.n_epochs + 1):
-            # Update annealed loss weights
+            # Anneal waveform weight only
             self.criterion.waveform_weight = self._wave_weight(epoch)
-            self.criterion.gradient_weight = self._grad_weight(epoch)
 
             train_metrics = self._run_epoch(self.train_dl, train=True)
             val_metrics   = self._run_epoch(self.val_dl,   train=False)
 
             elapsed = time.time() - t0
             lr_now  = self.scheduler.get_last_lr()[0]
+            wave_w  = self.criterion.waveform_weight
 
-            wave_w = self.criterion.waveform_weight
-            grad_w = self.criterion.gradient_weight
             print(f"\nEpoch {epoch}/{self.n_epochs}  "
-                  f"lr={lr_now:.2e}  wave_w={wave_w:.3f}  grad_w={grad_w:.3f}  "
-                  f"elapsed={elapsed:.0f}s")
+                  f"lr={lr_now:.2e}  wave_w={wave_w:.3f}  elapsed={elapsed:.0f}s")
             print(f"  Train — loss={train_metrics['loss']:.4f}  "
                   f"lm={train_metrics['lm_loss']:.4f}  "
                   f"wave={train_metrics['wave_loss']:.4f}  "
@@ -237,24 +223,17 @@ class SpectralTrainer:
                   f"wave={val_metrics['wave_loss']:.4f}  "
                   f"grad={val_metrics['grad_loss']:.4f}")
 
-            record = {
-                'epoch': epoch,
-                'train': train_metrics,
-                'val':   val_metrics,
-                'lr':    lr_now,
-            }
+            record = {'epoch': epoch, 'train': train_metrics,
+                      'val': val_metrics, 'lr': lr_now}
             self.history.append(record)
 
-            # Checkpoint best model
             if val_metrics['loss'] < best_val:
                 best_val = val_metrics['loss']
                 self._save(epoch, val_metrics['loss'], 'best')
 
-            # Periodic checkpoint
             if epoch % 10 == 0:
                 self._save(epoch, val_metrics['loss'], f'epoch{epoch:03d}')
 
-        # Final checkpoint + history
         self._save(self.n_epochs, self.history[-1]['val']['loss'], 'final')
         with open(self.ckpt_dir / 'training_history.json', 'w') as f:
             json.dump(self.history, f, indent=2)
@@ -265,22 +244,28 @@ class SpectralTrainer:
     def _save(self, epoch: int, val_loss: float, tag: str):
         path = self.ckpt_dir / f'spectral_{tag}.pt'
         torch.save({
-            'epoch':        epoch,
-            'val_loss':     val_loss,
-            'model_state':  self.model.state_dict(),
-            'opt_state':    self.optimizer.state_dict(),
-            'sched_state':  self.scheduler.state_dict(),
-            'history':      self.history,
-            'config':       self.config,
+            'epoch':       epoch,
+            'val_loss':    val_loss,
+            'model_state': self.model.state_dict(),
+            'opt_state':   self.optimizer.state_dict(),
+            'sched_state': self.scheduler.state_dict(),
+            'history':     self.history,
+            'config':      self.config,
         }, path)
 
     def resume(self, checkpoint_path: str):
         """Load model + optimizer + scheduler state to continue training."""
         ckpt = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(ckpt['model_state'])
+        # strict=False handles new parameters (log_sigma_head) not present in old checkpoints
+        missing, unexpected = self.model.load_state_dict(
+            ckpt['model_state'], strict=False
+        )
+        if missing:
+            print(f"  (initializing {len(missing)} new parameters from scratch: "
+                  f"{missing[:3]}{'...' if len(missing)>3 else ''})")
         self.optimizer.load_state_dict(ckpt['opt_state'])
         self.scheduler.load_state_dict(ckpt['sched_state'])
-        self.history = ckpt.get('history', [])
-        start_epoch  = ckpt['epoch'] + 1
+        self.history    = ckpt.get('history', [])
+        start_epoch     = ckpt['epoch'] + 1
         print(f"Resumed from epoch {ckpt['epoch']}  val_loss={ckpt['val_loss']:.4f}")
         return start_epoch

@@ -38,15 +38,19 @@ def main():
     parser.add_argument('--wave-schedule',  default='cosine',
                         choices=['cosine', 'linear', 'none'],
                         help='How to anneal waveform loss weight over epochs')
-    parser.add_argument('--no-band-init',   action='store_true',
+    parser.add_argument('--gradient-weight', type=float, default=0.1,
+                        help='Gradient consistency loss weight (constant; 0 to disable)')
+    parser.add_argument('--entropy-threshold', type=float, default=0.4,
+                        help='H_norm below which a position is "predictable"')
+    parser.add_argument('--no-band-init', action='store_true',
                         help='Initialize all frequencies uniformly in [0.02,0.50] '
                              'instead of banded — tests whether structure self-organizes')
     parser.add_argument('--no-acoustic-init', action='store_true',
-                        help='Random amplitude init instead of character acoustic profiles')
-    parser.add_argument('--no-bigram-init',  action='store_true',
-                        help='Skip bigram SVD amplitude init (falls back to acoustic or random)')
-    parser.add_argument('--gradient-weight', type=float, default=0.1,
-                        help='Weight for gradient consistency loss (0 to disable)')
+                        help='Fallback amplitude init: random instead of character '
+                             'acoustic profiles (only used when --no-laplacian-init)')
+    parser.add_argument('--no-laplacian-init', action='store_true',
+                        help='Skip Laplacian eigenvector amplitude init '
+                             '(falls back to acoustic or random)')
     parser.add_argument('--corpus',      default='data/corpus.txt',
                         help='.txt file with one Python file path per line')
     parser.add_argument('--corpus-dir',  default=None,
@@ -59,57 +63,55 @@ def main():
 
     tokenizer = PythonStructuralTokenizer()
 
-    # If resuming, load config from checkpoint
     if args.resume:
-        ckpt = torch.load(args.resume, map_location='cpu')
+        ckpt   = torch.load(args.resume, map_location='cpu')
         config = ckpt['config']
         print(f"Resuming from: {args.resume}  (epoch {ckpt['epoch']})")
     else:
         config = {
-            'mode':            args.mode,
-            'embed_dim':       args.embed_dim,
-            'n_layers':        args.n_layers,
-            'n_heads':         args.n_heads,
-            'max_seq_len':     args.max_seq_len,
-            'n_epochs':        args.epochs,
-            'lr':              args.lr,
-            'lm_weight':       args.lm_weight,
-            'waveform_weight': args.wave_weight,
-            'wave_schedule':   args.wave_schedule,
-            'band_init':       not args.no_band_init,
-            'acoustic_init':   not args.no_acoustic_init,
-            'bigram_init':     not args.no_bigram_init,
-            'gradient_weight': args.gradient_weight,
-            'band_weights':    [1.5, 1.0, 0.5],
-            'weight_decay':    0.01,
+            'mode':              args.mode,
+            'embed_dim':         args.embed_dim,
+            'n_layers':          args.n_layers,
+            'n_heads':           args.n_heads,
+            'max_seq_len':       args.max_seq_len,
+            'n_epochs':          args.epochs,
+            'lr':                args.lr,
+            'lm_weight':         args.lm_weight,
+            'waveform_weight':   args.wave_weight,
+            'wave_schedule':     args.wave_schedule,
+            'band_init':         not args.no_band_init,
+            'acoustic_init':     not args.no_acoustic_init,
+            'laplacian_init':    not args.no_laplacian_init,
+            'gradient_weight':   args.gradient_weight,
+            'entropy_threshold': args.entropy_threshold,
+            'band_weights':      [1.5, 1.0, 0.5],
+            'weight_decay':      0.01,
         }
 
-    # Allow overriding epoch count even when resuming
     config['n_epochs'] = args.epochs
 
     corpus_source = args.corpus_dir if args.corpus_dir else args.corpus
     print(f"Loading corpus from: {corpus_source}")
     train_ds = SpectralDataset(corpus_source, tokenizer,
-                                max_seq_len=config['max_seq_len'], split='train')
+                               max_seq_len=config['max_seq_len'], split='train')
     val_ds   = SpectralDataset(corpus_source, tokenizer,
-                                max_seq_len=config['max_seq_len'], split='val')
+                               max_seq_len=config['max_seq_len'], split='val')
 
     pad_id  = tokenizer.pad_id
     collate = partial(collate_fn, pad_id=pad_id)
 
     train_dl = DataLoader(train_ds, batch_size=args.batch_size,
-                           shuffle=True,  collate_fn=collate, num_workers=0)
+                          shuffle=True,  collate_fn=collate, num_workers=0)
     val_dl   = DataLoader(val_ds,   batch_size=args.batch_size,
-                           shuffle=False, collate_fn=collate, num_workers=0)
+                          shuffle=False, collate_fn=collate, num_workers=0)
 
-    # Use bigram SVD init unless --no-bigram-init is set (or we're resuming,
-    # in which case weights are overwritten by the checkpoint anyway).
-    use_bigram = config.get('bigram_init', True)
-    transition_matrix = train_ds.transition_matrix if use_bigram else None
+    # Laplacian eigenvectors for amplitude initialization (can be disabled)
+    use_laplacian = config.get('laplacian_init', True)
+    laplacian_eigvecs = train_ds.laplacian_eigvecs if use_laplacian else None
 
     print("\nBuilding SpectralLM...")
     model = build_model(config, tokenizer.vocab,
-                        transition_matrix=transition_matrix)
+                        laplacian_eigvecs=laplacian_eigvecs)
 
     trainer = SpectralTrainer(
         model          = model,
@@ -118,6 +120,7 @@ def main():
         config         = config,
         checkpoint_dir = args.checkpoint_dir,
         tokenizer      = tokenizer,
+        frozen_entropy = train_ds.frozen_entropy,
     )
 
     if args.resume:

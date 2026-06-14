@@ -2,9 +2,17 @@
 Dataset for SpectralLM — simple next-token prediction setup.
 
 Each sample: full tokenized file, returned as (token_ids, position_ids).
-DataLoader handles batching and padding.
+
+Corpus-level statistics computed once from all tokenized files (before split):
+  laplacian_eigvecs  — (vocab_size, vocab_size) eigenvectors of the normalized
+                       graph Laplacian of the symmetrized bigram matrix; used to
+                       initialize token amplitude profiles in SpectralEmbedding.
+  frozen_entropy     — (vocab_size,) Shannon entropy per token's outgoing bigram
+                       distribution, normalized to [0,1]; used by the waveform
+                       gradient consistency loss (never updated during training).
 """
 
+import math
 import random
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -17,19 +25,58 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from data.tokenizer import PythonStructuralTokenizer
 
 
-def compute_transition_matrix(samples: List[List[int]], vocab_size: int) -> torch.Tensor:
-    """Row-normalized bigram transition probability matrix from tokenized sequences."""
-    counts = torch.zeros(vocab_size, vocab_size)
+def compute_spectral_stats(
+    samples: List[List[int]],
+    vocab_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    From tokenized corpus sequences, compute:
+      1. Laplacian eigenvectors — for Laplacian amplitude initialization.
+      2. Frozen entropy          — for waveform gradient consistency loss.
+
+    Bigram matrix pipeline:
+      raw counts C[i,j] → smooth (add 1/V) → symmetrize → normalize → Laplacian
+
+    Returns:
+      eigvecs         (vocab_size, vocab_size)  columns = eigenvectors (ascending λ)
+      frozen_entropy  (vocab_size,)  H[i]/log(V) in [0,1]; higher = more variable
+    """
+    V = vocab_size
+
+    # Raw bigram counts
+    C = torch.zeros(V, V)
     for seq in samples:
         for i in range(len(seq) - 1):
-            counts[seq[i], seq[i + 1]] += 1.0
-    row_sums = counts.sum(dim=1, keepdim=True).clamp(min=1.0)
-    return counts / row_sums
+            C[seq[i], seq[i + 1]] += 1.0
+
+    # Laplacoscopic smoothing + symmetrize
+    C = C + 1.0 / V                 # add-1/V smoothing (no isolated nodes)
+    C_sym = (C + C.T) * 0.5         # make undirected
+
+    # ── Normalized graph Laplacian: L = I − D^{-½} C_sym D^{-½} ──────────
+    D = C_sym.sum(dim=1)            # (V,) degree
+    D_inv_sqrt = 1.0 / (D.sqrt() + 1e-8)
+    # L[i,j] = δ[i,j] − C_sym[i,j] / sqrt(D[i] * D[j])
+    L = torch.eye(V) - D_inv_sqrt.unsqueeze(1) * C_sym * D_inv_sqrt.unsqueeze(0)
+
+    # All eigenvectors, ascending by eigenvalue (smallest = smoothest graph signal)
+    _evals, eigvecs = torch.linalg.eigh(L)   # (V,) and (V, V)
+
+    # ── Per-token bigram entropy from C_sym row-normalized ─────────────────
+    P = C_sym / C_sym.sum(dim=1, keepdim=True)          # (V, V) stochastic
+    H = -(P * torch.log(P + 1e-9)).sum(dim=1)           # (V,) Shannon entropy
+    frozen_entropy = (H / math.log(V)).clamp(0.0, 1.0)  # (V,) in [0, 1]
+
+    return eigvecs, frozen_entropy
 
 
 class SpectralDataset(Dataset):
     """
     Loads Python source files and returns full token sequences.
+
+    Attributes set after __init__:
+      laplacian_eigvecs  (vocab_size, vocab_size) — pass to SpectralEmbedding
+      frozen_entropy     (vocab_size,)             — pass to SpectralTrainer
 
     Args:
         file_list:   path to corpus.txt (one file path per line), or list of paths
@@ -90,15 +137,17 @@ class SpectralDataset(Dataset):
             except Exception:
                 pass
 
-        # Bigram transition matrix from the full corpus (before any split)
+        # Corpus-level spectral statistics — computed from ALL samples before split
         vocab_size = len(self.tokenizer.vocab)
-        self.transition_matrix = compute_transition_matrix(all_samples, vocab_size)
+        self.laplacian_eigvecs, self.frozen_entropy = compute_spectral_stats(
+            all_samples, vocab_size
+        )
 
         # Reproducible split
         rng = random.Random(seed)
         rng.shuffle(all_samples)
 
-        n     = len(all_samples)
+        n      = len(all_samples)
         n_val  = max(1, int(n * val_frac))
         n_test = max(1, int(n * test_frac))
 
