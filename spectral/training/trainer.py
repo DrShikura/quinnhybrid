@@ -29,13 +29,14 @@ def build_model(config: dict, vocab: list,
     return SpectralLM(
         vocab              = vocab,
         embed_dim          = config.get('embed_dim',     64),
-        n_layers           = config.get('n_layers',       4),
+        n_loops            = config.get('n_loops',  config.get('n_layers', 3)),
         n_heads            = config.get('n_heads',        8),
         max_seq_len        = config.get('max_seq_len',  512),
         dropout            = config.get('dropout',      0.1),
         band_init          = config.get('band_init',    True),
         acoustic_init      = config.get('acoustic_init', True),
         laplacian_eigvecs  = laplacian_eigvecs,
+        mem_dim            = config.get('mem_dim',       32),
     )
 
 
@@ -93,6 +94,7 @@ class SpectralTrainer:
             band_weights      = tuple(config.get('band_weights', [1.5, 1.0, 0.5])),
             gradient_weight   = config.get('gradient_weight',  0.1),
             entropy_threshold = config.get('entropy_threshold', 0.4),
+            memory_weight     = config.get('memory_weight',    0.1),
         )
 
         # Optimizer with warmup + cosine decay
@@ -135,7 +137,7 @@ class SpectralTrainer:
 
     def _run_epoch(self, loader: DataLoader, train: bool) -> dict:
         self.model.train(train)
-        total_loss = total_lm = total_wave = total_grad = 0.0
+        total_loss = total_lm = total_wave = total_grad = total_mem = 0.0
         n_steps    = 0
 
         with torch.set_grad_enabled(train):
@@ -173,6 +175,7 @@ class SpectralTrainer:
                 if 'lm'         in losses: total_lm   += losses['lm'].item()
                 if 'wave_total' in losses: total_wave += losses['wave_total'].item()
                 if 'grad'       in losses: total_grad += losses['grad'].item()
+                if 'mem'        in losses: total_mem  += losses['mem'].item()
                 n_steps += 1
 
         return {
@@ -180,21 +183,23 @@ class SpectralTrainer:
             'lm_loss':   total_lm   / max(n_steps, 1),
             'wave_loss': total_wave / max(n_steps, 1),
             'grad_loss': total_grad / max(n_steps, 1),
+            'mem_loss':  total_mem  / max(n_steps, 1),
         }
 
     def train(self):
         counts = self.model.param_count()
         print(f"\nSpectralLM parameters: {counts['total']:,}")
         print(f"  Embedding:   {counts['embedding']:,}")
-        print(f"  Transformer: {counts['transformer']:,}")
-        print(f"  Heads:       {counts['heads']:,}")
-        print(f"\nMode: {self.mode}   Epochs: {self.n_epochs}")
+        print(f"  Transformer: {counts['transformer']:,}  (1 shared layer × {self.model.n_loops} loops)")
+        print(f"  Memory:      {counts['memory']:,}")
+        print(f"  Heads:       {counts['heads']:,}  (LM head partially tied to amplitude)")
+        print(f"\nMode: {self.mode}   Epochs: {self.n_epochs}   Loops/step: {self.model.n_loops}")
         emb = self.model.embedding
         print(f"Structural band: dims 0-{emb.structural_end}")
         print(f"Expression band: dims {emb.structural_end}-{emb.expr_end}")
         print(f"Semantic band:   dims {emb.expr_end}-{self.model.embed_dim}")
-        grad_w = self.criterion.gradient_weight
-        print(f"Gradient consistency loss weight: {grad_w:.3f} (constant)")
+        print(f"Gradient consistency loss weight: {self.criterion.gradient_weight:.3f} (constant)")
+        print(f"Memory loss weight:               {self.criterion.memory_weight:.3f} (constant)")
         print("=" * 60)
 
         start_epoch = getattr(self, '_start_epoch', 1)
@@ -217,11 +222,13 @@ class SpectralTrainer:
             print(f"  Train — loss={train_metrics['loss']:.4f}  "
                   f"lm={train_metrics['lm_loss']:.4f}  "
                   f"wave={train_metrics['wave_loss']:.4f}  "
-                  f"grad={train_metrics['grad_loss']:.4f}")
+                  f"grad={train_metrics['grad_loss']:.4f}  "
+                  f"mem={train_metrics['mem_loss']:.4f}")
             print(f"  Val   — loss={val_metrics['loss']:.4f}  "
                   f"lm={val_metrics['lm_loss']:.4f}  "
                   f"wave={val_metrics['wave_loss']:.4f}  "
-                  f"grad={val_metrics['grad_loss']:.4f}")
+                  f"grad={val_metrics['grad_loss']:.4f}  "
+                  f"mem={val_metrics['mem_loss']:.4f}")
 
             record = {'epoch': epoch, 'train': train_metrics,
                       'val': val_metrics, 'lr': lr_now}

@@ -203,8 +203,17 @@ class SpectralEmbedding(nn.Module):
                 positions: torch.Tensor) -> torch.Tensor:
         """
         Returns (B, T, 2*embed_dim): [amp*cos(phase) | amp*sin(phase)].
+
+        During training, each token's amplitude vector is randomly sign-flipped
+        (per-token scalar ±1, broadcast across all D dims). Laplacian eigenvectors
+        are only defined up to sign, so this augmentation prevents the model from
+        relying on absolute sign and regularizes the amplitude basis.
         """
-        amp   = self.amplitude(tokens)                                  # (B, T, D)
+        amp = self.amplitude(tokens)                                    # (B, T, D)
+        if self.training:
+            signs = (torch.randint(0, 2, (amp.size(0), amp.size(1), 1),
+                                   device=amp.device) * 2 - 1).float()
+            amp = amp * signs
         pos_f = positions.float().unsqueeze(-1) / self.max_seq_len      # (B, T, 1)
         phase = self.freq.unsqueeze(0).unsqueeze(0) * pos_f * 2 * math.pi  # (B, T, D)
         return torch.cat([amp * torch.cos(phase),

@@ -142,6 +142,7 @@ class SpectralLoss(nn.Module):
         band_weights:       per-band waveform loss weights
         gradient_weight:    weight on gradient consistency loss (CONSTANT — not annealed)
         entropy_threshold:  H_norm threshold for "predictable" positions
+        memory_weight:      weight on entity memory associative loss (CONSTANT)
     """
 
     def __init__(
@@ -154,11 +155,13 @@ class SpectralLoss(nn.Module):
         band_weights:      tuple = (1.5, 1.0, 0.5),
         gradient_weight:   float = 0.1,
         entropy_threshold: float = 0.4,
+        memory_weight:     float = 0.1,
     ):
         super().__init__()
         self.lm_weight       = lm_weight
         self.waveform_weight = waveform_weight
         self.gradient_weight = gradient_weight   # never modified during training
+        self.memory_weight   = memory_weight     # never modified during training
 
         self.waveform_loss  = BandedWaveformLoss(
             embed_dim, structural_end, expr_end, band_weights
@@ -207,6 +210,12 @@ class SpectralLoss(nn.Module):
             )
             losses['grad'] = grad_loss
             total = total + self.gradient_weight * grad_loss
+
+        # Entity memory associative loss (L_memory)
+        if self.memory_weight > 0 and 'mem_loss' in model_out:
+            mem_loss = model_out['mem_loss']
+            losses['mem'] = mem_loss
+            total = total + self.memory_weight * mem_loss
 
         losses['total'] = total
         return losses

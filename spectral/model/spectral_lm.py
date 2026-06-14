@@ -5,13 +5,24 @@ Architecture:
     Input tokens
         ↓
     SpectralEmbedding       Laplacian eigenvector init + MoPE sinusoidal PE
+                            Random sign flip per token during training
         ↓
-    SpectralTransformerLayer × n_layers
-        causal self-attention with per-head locality distance bias
-        (structural heads → near-global attention; semantic heads → local)
+    [Loop R times]:
+        SpectralTransformerLayer   shared weights across loops
+            EGA energy gate on values (scalar per position, 1 linear layer)
+            Causal attention + ALiBi-style per-head locality bias
+            FF network
+                ↓
+        EntityMemory               Titans-style fast-weight associative memory
+            Surprise = prediction error (||M·k - v||) as gradient-magnitude proxy
+            Update: momentum + weight-decay, gated by surprise
+            Output: additive to hidden state
         ↓
-    WaveformHead            predicts next-token amplitude (waveform completion)
-    LanguageModelHead       predicts next-token id (LM)
+    LayerNorm
+        ↓
+    LM head:        partially tied to amplitude embedding
+                    logits = h_real @ amplitude.weight.T + lm_head_extra(h_imag)
+    Waveform head:  separate small projection → next-token amplitude
 
 Training modes:
     'waveform': waveform completion pre-training
@@ -29,18 +40,17 @@ from .encoding import SpectralEmbedding
 
 class SpectralTransformerLayer(nn.Module):
     """
-    Transformer layer with learned per-head locality distance bias.
+    Shared transformer layer with EGA and ALiBi-style per-head locality bias.
 
-    Standard causal self-attention scores are augmented with a penalty term:
-        score[b, h, i, j] -= |pos_i - pos_j| / sigma_h
+    EGA (Energy Gate on value Aggregation):
+        gate = sigmoid(W_gate · x_norm)   shape (B, T, 1)
+        v_gated = v * gate                applied before attention aggregation
+    Suppresses low-confidence value contributions at low-energy positions.
 
-    sigma_h is a per-head learnable scale initialized from the embedding's
-    log_sigma (which encodes the band structure: structural dims get large sigma
-    → near-zero penalty → global attention; semantic dims get small sigma →
-    large penalty → highly local attention).
-
-    Each head h attends to embedding dimensions [h*half : (h+1)*half] in both
-    the real and imaginary halves (half = embed_dim // n_heads).
+    Locality bias (ALiBi-style):
+        score[b, h, i, j] -= |pos_i - pos_j| / σ_h
+    σ_h is a per-head learnable scale initialized from the embedding's log_sigma
+    band structure (structural heads → large σ → near-global; semantic → small σ → local).
     """
 
     def __init__(
@@ -57,17 +67,16 @@ class SpectralTransformerLayer(nn.Module):
         self.head_dim = dim // n_heads
         self.scale    = math.sqrt(self.head_dim)
 
-        # Combined QKV + output projections
-        self.in_proj   = nn.Linear(dim, 3 * dim, bias=True)
-        self.out_proj  = nn.Linear(dim, dim, bias=True)
-        self.attn_drop = nn.Dropout(dropout)
+        self.in_proj     = nn.Linear(dim, 3 * dim, bias=True)
+        self.out_proj    = nn.Linear(dim, dim, bias=True)
+        self.energy_gate = nn.Linear(dim, 1, bias=True)    # EGA: scalar gate per position
+        self.attn_drop   = nn.Dropout(dropout)
 
-        # Per-head locality scale — initialized from embedding band structure,
-        # then trained independently from SpectralEmbedding.log_sigma.
+        # Per-head locality scale — initialized from embedding band structure.
         # half = embed_dim // n_heads: head h covers real dims [h*half:(h+1)*half].
         half = self.head_dim // 2
         with torch.no_grad():
-            sigma_init  = torch.exp(log_sigma_init.detach())   # (embed_dim,)
+            sigma_init     = torch.exp(log_sigma_init.detach())   # (embed_dim,)
             per_head_sigma = torch.stack([
                 sigma_init[h * half : (h + 1) * half].mean()
                 for h in range(n_heads)
@@ -91,85 +100,184 @@ class SpectralTransformerLayer(nn.Module):
         nn.init.zeros_(self.in_proj.bias)
         nn.init.xavier_uniform_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
+        nn.init.xavier_uniform_(self.energy_gate.weight)
+        nn.init.zeros_(self.energy_gate.bias)
 
     def forward(self, x: torch.Tensor,
                 causal_mask: torch.Tensor | None = None) -> torch.Tensor:
         B, T, D = x.shape
         H, HD   = self.n_heads, self.head_dim
 
-        # Pre-norm
         residual = x
-        x = self.norm1(x)
+        x_norm   = self.norm1(x)
 
         # QKV projections → split heads
-        qkv = self.in_proj(x)                               # (B, T, 3D)
+        qkv = self.in_proj(x_norm)
         q, k, v = qkv.split(D, dim=-1)
         q = q.view(B, T, H, HD).transpose(1, 2)            # (B, H, T, HD)
         k = k.view(B, T, H, HD).transpose(1, 2)
         v = v.view(B, T, H, HD).transpose(1, 2)
 
-        # Scaled dot-product
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale  # (B, H, T, T)
+        # EGA: energy gate on values before aggregation
+        gate = torch.sigmoid(self.energy_gate(x_norm))      # (B, T, 1)
+        v    = v * gate.unsqueeze(1)                        # (B, H, T, 1) → (B, H, T, HD)
 
-        # Locality bias: -(|pos_i − pos_j| / σ_h) — penalizes distant attention
+        # Scaled dot-product + ALiBi-style locality bias
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale   # (B, H, T, T)
+
         pos   = torch.arange(T, device=x.device).float()
-        dist  = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs()          # (T, T)
-        sigma = torch.exp(self.log_sigma_head)                        # (H,)
-        bias  = -(dist.unsqueeze(0) / (sigma.view(H, 1, 1) + 1e-6)) # (H, T, T)
-        scores = scores + bias.unsqueeze(0)                           # (B, H, T, T)
+        dist  = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs()           # (T, T)
+        sigma = torch.exp(self.log_sigma_head)                         # (H,)
+        bias  = -(dist.unsqueeze(0) / (sigma.view(H, 1, 1) + 1e-6))  # (H, T, T)
+        scores = scores + bias.unsqueeze(0)
 
-        # Causal mask (upper-triangular -inf)
         if causal_mask is not None:
             scores = scores + causal_mask.view(1, 1, T, T)
 
-        # Attention weights
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_drop(attn)
 
-        # Weighted sum → merge heads
-        out = torch.matmul(attn, v)                                   # (B, H, T, HD)
+        out = torch.matmul(attn, v)                                    # (B, H, T, HD)
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         x   = residual + self.out_proj(out)
 
-        # Feed-forward
         x = x + self.ff(self.norm2(x))
         return x
 
 
+class EntityMemory(nn.Module):
+    """
+    Simplified Titans-style associative fast-weight memory.
+
+    Maintains a (B, mem_dim, mem_dim) fast-weight matrix M per sequence,
+    reset to zero at the start of each forward pass. The memory state carries
+    across R transformer loops, accumulating information over depth.
+
+    At each position t (processed causally):
+        k_t      = normalize(key_proj(h_t))
+        v_t      = val_proj(h_t)
+        m_t      = M · k_t                            (readout BEFORE update)
+        error_t  = v_t − m_t                          (prediction error ≈ surprise)
+        gate_t   = sigmoid(||error_t|| + gate_bias)
+        M        = (momentum − weight_decay) · M + gate_t · error_t ⊗ k_t
+
+    M is detached between steps — gradient flows through key_proj, val_proj,
+    out_proj, gate_bias via each step's current computation only, not BPTT.
+
+    L_memory = mean(||error_t||²) trains the projections to make the memory
+    a useful associative store for the current sequence context.
+    """
+
+    def __init__(
+        self,
+        dim:          int,
+        mem_dim:      int,
+        momentum:     float = 0.9,
+        weight_decay: float = 0.01,
+    ):
+        super().__init__()
+        self.mem_dim      = mem_dim
+        self.momentum     = momentum
+        self.weight_decay = weight_decay
+
+        self.key_proj  = nn.Linear(dim, mem_dim, bias=False)
+        self.val_proj  = nn.Linear(dim, mem_dim, bias=False)
+        self.out_proj  = nn.Linear(mem_dim, dim, bias=True)
+        self.gate_bias = nn.Parameter(torch.zeros(1))
+
+        nn.init.xavier_uniform_(self.key_proj.weight)
+        nn.init.xavier_uniform_(self.val_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        M: 'torch.Tensor | None' = None,
+    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
+        """
+        h:  (B, T, dim)           hidden states from current loop iteration
+        M:  (B, mem_dim, mem_dim) fast-weight state (None → initialize zeros)
+
+        Returns: (output, mem_loss, M_new)
+            output:   (B, T, dim)         memory readout, added to hidden
+            mem_loss: scalar              mean prediction error (L_memory term)
+            M_new:    (B, mem_dim, mem_dim) updated fast-weight state
+        """
+        B, T, _ = h.shape
+        Md = self.mem_dim
+
+        if M is None:
+            M = h.new_zeros(B, Md, Md)
+
+        K = F.normalize(self.key_proj(h), dim=-1)   # (B, T, Md)
+        V = self.val_proj(h)                          # (B, T, Md)
+
+        readouts  = []
+        sq_errors = []
+
+        for t in range(T):
+            k_t   = K[:, t]    # (B, Md)
+            v_t   = V[:, t]    # (B, Md)
+
+            # Causal readout from state before this step's update
+            m_t   = torch.bmm(M.detach(), k_t.unsqueeze(-1)).squeeze(-1)  # (B, Md)
+            error = v_t - m_t                                               # (B, Md)
+            surp  = error.norm(dim=-1, keepdim=True)                       # (B, 1)
+            gate  = torch.sigmoid(surp + self.gate_bias)                   # (B, 1)
+
+            outer = torch.bmm(error.unsqueeze(-1), k_t.unsqueeze(1))      # (B, Md, Md)
+            M     = ((self.momentum - self.weight_decay) * M.detach()
+                     + gate.unsqueeze(-1) * outer)
+
+            readouts.append(self.out_proj(m_t))
+            sq_errors.append(error.pow(2).mean())
+
+        output   = torch.stack(readouts, dim=1)     # (B, T, dim)
+        mem_loss = torch.stack(sq_errors).mean()
+        return output, mem_loss, M
+
+
 class SpectralLM(nn.Module):
     """
-    Unified spectral language model.
+    Unified spectral language model with shared-weight transformer loops
+    and Titans-style entity memory.
 
     Args:
-        vocab:             list of token strings (for acoustic fallback init)
-        embed_dim:         per-modality embedding dim (output is 2*embed_dim)
-        n_layers:          number of Transformer layers
+        vocab:             list of token strings
+        embed_dim:         per-modality dim (output hidden = 2*embed_dim)
+        n_layers:          legacy alias for n_loops
         n_heads:           attention heads (must divide 2*embed_dim)
         max_seq_len:       maximum sequence length
         dropout:           dropout rate
-        band_init:         if True, initialize freq[] in three bands
-        acoustic_init:     if True (and no Laplacian eigvecs), use acoustic amplitude init
-        laplacian_eigvecs: (vocab_size, vocab_size) from SpectralDataset; if provided,
-                           uses Laplacian eigenvectors for amplitude init
+        band_init:         banded frequency initialization
+        acoustic_init:     acoustic fallback amplitude init
+        laplacian_eigvecs: (V, V) Laplacian eigenvectors for amplitude init
+        n_loops:           R — how many times to apply the shared transformer layer
+        mem_dim:           fast-weight memory dimension (0 to disable EntityMemory)
     """
 
     def __init__(
         self,
         vocab:             list,
         embed_dim:         int = 64,
-        n_layers:          int = 4,
+        n_layers:          int = 3,
         n_heads:           int = 8,
         max_seq_len:       int = 512,
         dropout:           float = 0.1,
         band_init:         bool = True,
         acoustic_init:     bool = True,
         laplacian_eigvecs: 'torch.Tensor | None' = None,
+        n_loops:           'int | None' = None,
+        mem_dim:           int = 32,
     ):
         super().__init__()
 
         self.vocab_size = len(vocab)
         self.embed_dim  = embed_dim
-        self.dim        = 2 * embed_dim   # real + imag concatenated
+        self.dim        = 2 * embed_dim
+        self.n_loops    = n_loops if n_loops is not None else n_layers
+        self.mem_dim    = mem_dim
 
         assert self.dim % n_heads == 0, \
             f"2*embed_dim ({self.dim}) must be divisible by n_heads ({n_heads})"
@@ -185,35 +293,38 @@ class SpectralLM(nn.Module):
             laplacian_eigvecs = laplacian_eigvecs,
         )
 
-        # ── Transformer — locality bias init from embedding's log_sigma ──────
+        # ── Single shared transformer layer (looped n_loops times) ───────────
         log_sigma_init = self.embedding.log_sigma.data.clone()
-        self.layers = nn.ModuleList([
-            SpectralTransformerLayer(
-                dim            = self.dim,
-                n_heads        = n_heads,
-                log_sigma_init = log_sigma_init,
-                dropout        = dropout,
-            )
-            for _ in range(n_layers)
-        ])
+        self.shared_layer = SpectralTransformerLayer(
+            dim            = self.dim,
+            n_heads        = n_heads,
+            log_sigma_init = log_sigma_init,
+            dropout        = dropout,
+        )
+
+        # ── Entity memory (optional, disabled when mem_dim=0) ────────────────
+        self.entity_memory = EntityMemory(self.dim, mem_dim) if mem_dim > 0 else None
+
         self.norm = nn.LayerNorm(self.dim)
 
-        # ── Heads ────────────────────────────────────────────────────────────
-        # Waveform head: predict next token's amplitude vector (D, not 2D).
-        # Amplitude target (not full waveform) avoids phase-prediction degeneracy.
+        # ── Output heads ─────────────────────────────────────────────────────
+        # Waveform head: separate small projection (D, not 2D target)
         self.waveform_head = nn.Linear(self.dim, embed_dim)
-        self.lm_head       = nn.Linear(self.dim, self.vocab_size)
+
+        # LM head: partially tied to amplitude embedding.
+        # The real half of hidden projects through amplitude (same basis as input),
+        # the imaginary half through an independent learned projection.
+        self.lm_head_extra = nn.Linear(embed_dim, self.vocab_size, bias=True)
 
         self._init_output_heads()
 
     def _init_output_heads(self):
         nn.init.normal_(self.waveform_head.weight, std=0.02)
         nn.init.zeros_(self.waveform_head.bias)
-        nn.init.normal_(self.lm_head.weight, std=0.02)
-        nn.init.zeros_(self.lm_head.bias)
+        nn.init.normal_(self.lm_head_extra.weight, std=0.02)
+        nn.init.zeros_(self.lm_head_extra.bias)
 
     def _causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
-        """Upper-triangular -inf mask for causal attention. Shape: (T, T)."""
         mask = torch.triu(torch.ones(T, T, device=device), diagonal=1)
         return mask.masked_fill(mask == 1, float('-inf'))
 
@@ -228,35 +339,55 @@ class SpectralLM(nn.Module):
             'hidden':    (B, T, dim)      final hidden states
             'lm_logits': (B, T, vocab)    next-token logits  (if mode includes lm)
             'waveform':  (B, T, D)        predicted next amplitude (if waveform mode)
-            'embedding': (B, T, 2D)       input waveform (kept in graph for grad loss)
+            'embedding': (B, T, 2D)       input waveform (for gradient consistency loss)
+            'mem_loss':  scalar           mean memory prediction error across loops
         """
         B, T = tokens.shape
 
-        # Spectral embedding — kept in computation graph for gradient consistency loss
-        x = self.embedding(tokens, positions)
+        x             = self.embedding(tokens, positions)
         embedding_out = x
 
-        # Causal Transformer with locality bias
-        causal_mask = self._causal_mask(T, tokens.device)
-        for layer in self.layers:
-            x = layer(x, causal_mask)
+        causal_mask    = self._causal_mask(T, tokens.device)
+        M              = None
+        total_mem_loss = torch.tensor(0.0, device=tokens.device)
+
+        for _ in range(self.n_loops):
+            x = self.shared_layer(x, causal_mask)
+            if self.entity_memory is not None:
+                mem_out, mem_loss, M = self.entity_memory(x, M)
+                x              = x + mem_out
+                total_mem_loss = total_mem_loss + mem_loss
+
         x = self.norm(x)
 
-        out = {'hidden': x, 'embedding': embedding_out}
+        out = {
+            'hidden':    x,
+            'embedding': embedding_out,
+            'mem_loss':  total_mem_loss / max(self.n_loops, 1),
+        }
 
         if mode in ('lm', 'joint'):
-            out['lm_logits'] = self.lm_head(x)         # (B, T, vocab)
+            h_real = x[:, :, :self.embed_dim]                    # (B, T, D)
+            h_imag = x[:, :, self.embed_dim:]                    # (B, T, D)
+            out['lm_logits'] = (
+                h_real @ self.embedding.amplitude.weight.T        # tied part
+                + self.lm_head_extra(h_imag)                      # free part
+            )
 
         if mode in ('waveform', 'joint'):
-            out['waveform'] = self.waveform_head(x)    # (B, T, D)
+            out['waveform'] = self.waveform_head(x)              # (B, T, D)
 
         return out
 
     def param_count(self) -> dict:
         total       = sum(p.numel() for p in self.parameters())
         embed       = sum(p.numel() for p in self.embedding.parameters())
-        transformer = sum(p.numel() for p in self.layers.parameters())
+        transformer = sum(p.numel() for p in self.shared_layer.parameters())
+        memory      = (sum(p.numel() for p in self.entity_memory.parameters())
+                       if self.entity_memory is not None else 0)
         heads       = (sum(p.numel() for p in self.waveform_head.parameters()) +
-                       sum(p.numel() for p in self.lm_head.parameters()))
-        return {'total': total, 'embedding': embed,
-                'transformer': transformer, 'heads': heads}
+                       sum(p.numel() for p in self.lm_head_extra.parameters()))
+        return {
+            'total': total, 'embedding': embed,
+            'transformer': transformer, 'memory': memory, 'heads': heads,
+        }

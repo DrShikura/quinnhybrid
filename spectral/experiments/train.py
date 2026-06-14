@@ -38,6 +38,12 @@ def main():
     parser.add_argument('--wave-schedule',  default='cosine',
                         choices=['cosine', 'linear', 'none'],
                         help='How to anneal waveform loss weight over epochs')
+    parser.add_argument('--n-loops',         type=int,   default=3,
+                        help='How many times to loop the single shared transformer layer (R)')
+    parser.add_argument('--mem-dim',         type=int,   default=32,
+                        help='Entity memory fast-weight dimension (0 to disable)')
+    parser.add_argument('--memory-weight',   type=float, default=0.1,
+                        help='Entity memory associative loss weight (constant; 0 to disable)')
     parser.add_argument('--gradient-weight', type=float, default=0.1,
                         help='Gradient consistency loss weight (constant; 0 to disable)')
     parser.add_argument('--entropy-threshold', type=float, default=0.4,
@@ -71,7 +77,7 @@ def main():
         config = {
             'mode':              args.mode,
             'embed_dim':         args.embed_dim,
-            'n_layers':          args.n_layers,
+            'n_loops':           args.n_loops,
             'n_heads':           args.n_heads,
             'max_seq_len':       args.max_seq_len,
             'n_epochs':          args.epochs,
@@ -84,6 +90,8 @@ def main():
             'laplacian_init':    not args.no_laplacian_init,
             'gradient_weight':   args.gradient_weight,
             'entropy_threshold': args.entropy_threshold,
+            'mem_dim':           args.mem_dim,
+            'memory_weight':     args.memory_weight,
             'band_weights':      [1.5, 1.0, 0.5],
             'weight_decay':      0.01,
         }
