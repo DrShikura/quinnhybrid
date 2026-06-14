@@ -160,10 +160,15 @@ class SpectralTrainer:
         print(f"Semantic band:   dims {self.model.embedding.expr_end}-{self.model.embed_dim}")
         print("=" * 60)
 
-        best_val = float('inf')
+        start_epoch = getattr(self, '_start_epoch', 1)
+        # Restore best_val from history if resuming
+        if self.history:
+            best_val = min(r['val']['loss'] for r in self.history)
+        else:
+            best_val = float('inf')
         t0 = time.time()
 
-        for epoch in range(1, self.n_epochs + 1):
+        for epoch in range(start_epoch, self.n_epochs + 1):
             train_metrics = self._run_epoch(self.train_dl, train=True)
             val_metrics   = self._run_epoch(self.val_dl,   train=False)
 
@@ -207,8 +212,22 @@ class SpectralTrainer:
     def _save(self, epoch: int, val_loss: float, tag: str):
         path = self.ckpt_dir / f'spectral_{tag}.pt'
         torch.save({
-            'epoch':       epoch,
-            'val_loss':    val_loss,
-            'model_state': self.model.state_dict(),
-            'config':      self.config,
+            'epoch':        epoch,
+            'val_loss':     val_loss,
+            'model_state':  self.model.state_dict(),
+            'opt_state':    self.optimizer.state_dict(),
+            'sched_state':  self.scheduler.state_dict(),
+            'history':      self.history,
+            'config':       self.config,
         }, path)
+
+    def resume(self, checkpoint_path: str):
+        """Load model + optimizer + scheduler state to continue training."""
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(ckpt['model_state'])
+        self.optimizer.load_state_dict(ckpt['opt_state'])
+        self.scheduler.load_state_dict(ckpt['sched_state'])
+        self.history = ckpt.get('history', [])
+        start_epoch  = ckpt['epoch'] + 1
+        print(f"Resumed from epoch {ckpt['epoch']}  val_loss={ckpt['val_loss']:.4f}")
+        return start_epoch
