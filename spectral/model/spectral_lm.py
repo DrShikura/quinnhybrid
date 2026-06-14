@@ -147,25 +147,26 @@ class SpectralTransformerLayer(nn.Module):
 
 class EntityMemory(nn.Module):
     """
-    Simplified Titans-style associative fast-weight memory.
+    Titans-style associative fast-weight memory with chunked causal scan.
 
-    Maintains a (B, mem_dim, mem_dim) fast-weight matrix M per sequence,
-    reset to zero at the start of each forward pass. The memory state carries
-    across R transformer loops, accumulating information over depth.
+    Maintains a (B, mem_dim, mem_dim) fast-weight matrix M per sequence.
+    The sequence is processed in chunks of size `chunk_size` (default 16).
+    Within each chunk all positions share the same M (from before the chunk),
+    then M is updated once in bulk at the chunk boundary. This gives strict
+    causality at chunk boundaries and reduces Python loop overhead ~chunk_size×
+    vs a token-by-token scan (128→8 iterations for seq_len=128, chunk=16).
 
-    At each position t (processed causally):
-        k_t      = normalize(key_proj(h_t))
-        v_t      = val_proj(h_t)
-        m_t      = M · k_t                            (readout BEFORE update)
-        error_t  = v_t − m_t                          (prediction error ≈ surprise)
-        gate_t   = sigmoid(||error_t|| + gate_bias)
-        M        = (momentum − weight_decay) · M + gate_t · error_t ⊗ k_t
+    Per chunk c covering positions [s, s+C):
+        K_c = normalize(key_proj(h_c))       (B, C, Md)
+        V_c = val_proj(h_c)                  (B, C, Md)
+        M_c = M · K_c^T                      (B, Md, C)  — readout (same M for all C)
+        E_c = V_c − M_c^T                    (B, C, Md)  — prediction error
+        gate = sigmoid(||E_c|| + gate_bias)  (B, C, 1)
+        M   = γ · M + (gate · E_c)^T · K_c  (B, Md, Md) — bulk outer-product update
 
-    M is detached between steps — gradient flows through key_proj, val_proj,
-    out_proj, gate_bias via each step's current computation only, not BPTT.
-
-    L_memory = mean(||error_t||²) trains the projections to make the memory
-    a useful associative store for the current sequence context.
+    L_memory = mean(||E_c||²) across all positions.
+    M is detached before each chunk read/write; gradient flows only through
+    key_proj, val_proj, out_proj, gate_bias for the current chunk's computation.
     """
 
     def __init__(
@@ -174,11 +175,13 @@ class EntityMemory(nn.Module):
         mem_dim:      int,
         momentum:     float = 0.9,
         weight_decay: float = 0.01,
+        chunk_size:   int   = 16,
     ):
         super().__init__()
         self.mem_dim      = mem_dim
         self.momentum     = momentum
         self.weight_decay = weight_decay
+        self.chunk_size   = chunk_size
 
         self.key_proj  = nn.Linear(dim, mem_dim, bias=False)
         self.val_proj  = nn.Linear(dim, mem_dim, bias=False)
@@ -200,12 +203,13 @@ class EntityMemory(nn.Module):
         M:  (B, mem_dim, mem_dim) fast-weight state (None → initialize zeros)
 
         Returns: (output, mem_loss, M_new)
-            output:   (B, T, dim)         memory readout, added to hidden
-            mem_loss: scalar              mean prediction error (L_memory term)
+            output:   (B, T, dim)           memory readout, added to hidden
+            mem_loss: scalar                mean prediction error (L_memory term)
             M_new:    (B, mem_dim, mem_dim) updated fast-weight state
         """
         B, T, _ = h.shape
-        Md = self.mem_dim
+        Md, C   = self.mem_dim, self.chunk_size
+        gamma   = self.momentum - self.weight_decay
 
         if M is None:
             M = h.new_zeros(B, Md, Md)
@@ -213,28 +217,32 @@ class EntityMemory(nn.Module):
         K = F.normalize(self.key_proj(h), dim=-1)   # (B, T, Md)
         V = self.val_proj(h)                          # (B, T, Md)
 
-        readouts  = []
-        sq_errors = []
+        readout_chunks = []
+        sq_error_chunks = []
 
-        for t in range(T):
-            k_t   = K[:, t]    # (B, Md)
-            v_t   = V[:, t]    # (B, Md)
+        for s in range(0, T, C):
+            e = min(s + C, T)
+            K_c = K[:, s:e]   # (B, C, Md)
+            V_c = V[:, s:e]   # (B, C, Md)
 
-            # Causal readout from state before this step's update
-            m_t   = torch.bmm(M.detach(), k_t.unsqueeze(-1)).squeeze(-1)  # (B, Md)
-            error = v_t - m_t                                               # (B, Md)
-            surp  = error.norm(dim=-1, keepdim=True)                       # (B, 1)
-            gate  = torch.sigmoid(surp + self.gate_bias)                   # (B, 1)
+            # Causal readout — all positions in chunk use M from before this chunk
+            M_c = torch.bmm(M.detach(), K_c.transpose(1, 2))   # (B, Md, C)
+            m_c = M_c.transpose(1, 2)                            # (B, C, Md)
 
-            outer = torch.bmm(error.unsqueeze(-1), k_t.unsqueeze(1))      # (B, Md, Md)
-            M     = ((self.momentum - self.weight_decay) * M.detach()
-                     + gate.unsqueeze(-1) * outer)
+            E_c  = V_c - m_c                                     # (B, C, Md)
+            surp = E_c.norm(dim=-1, keepdim=True)                # (B, C, 1)
+            gate = torch.sigmoid(surp + self.gate_bias)          # (B, C, 1)
 
-            readouts.append(self.out_proj(m_t))
-            sq_errors.append(error.pow(2).mean())
+            # Bulk outer-product update for the chunk
+            weighted = gate * E_c                                 # (B, C, Md)
+            M_delta  = torch.bmm(weighted.transpose(1, 2), K_c)  # (B, Md, Md)
+            M        = gamma * M.detach() + M_delta
 
-        output   = torch.stack(readouts, dim=1)     # (B, T, dim)
-        mem_loss = torch.stack(sq_errors).mean()
+            readout_chunks.append(self.out_proj(m_c))            # (B, C, dim)
+            sq_error_chunks.append(E_c.pow(2).mean())
+
+        output   = torch.cat(readout_chunks, dim=1)              # (B, T, dim)
+        mem_loss = torch.stack(sq_error_chunks).mean()
         return output, mem_loss, M
 
 
