@@ -33,8 +33,12 @@ def main():
     parser.add_argument('--batch-size',  type=int, default=32)
     parser.add_argument('--max-seq-len', type=int, default=256)
     parser.add_argument('--lr',          type=float, default=3e-4)
-    parser.add_argument('--lm-weight',   type=float, default=1.0)
-    parser.add_argument('--wave-weight', type=float, default=0.5)
+    parser.add_argument('--lm-weight',      type=float, default=1.0)
+    parser.add_argument('--wave-weight',    type=float, default=0.5)
+    parser.add_argument('--wave-schedule',  default='cosine',
+                        choices=['cosine', 'linear', 'none'],
+                        help='How to anneal waveform loss weight over epochs '
+                             '(cosine: full→0, linear: full→0, none: constant)')
     parser.add_argument('--corpus',      default='data/corpus.txt',
                         help='.txt file with one Python file path per line')
     parser.add_argument('--corpus-dir',  default=None,
@@ -63,6 +67,7 @@ def main():
             'lr':              args.lr,
             'lm_weight':       args.lm_weight,
             'waveform_weight': args.wave_weight,
+            'wave_schedule':   args.wave_schedule,
             'band_weights':    [1.5, 1.0, 0.5],
             'weight_decay':    0.01,
         }

@@ -97,6 +97,23 @@ class SpectralTrainer:
 
         self.history = []
 
+    def _wave_weight(self, epoch: int) -> float:
+        """Return scheduled wave weight for this epoch.
+
+        'cosine': base_weight * (1 + cos(π * t)) / 2  — full at epoch 1, 0 at end
+        'linear': linearly decays to 0
+        'none':   constant (original behaviour)
+        """
+        base_w   = self.config.get('waveform_weight', 0.5)
+        schedule = self.config.get('wave_schedule', 'cosine')
+        if schedule == 'none':
+            return base_w
+        progress = (epoch - 1) / max(self.n_epochs - 1, 1)  # 0 → 1
+        if schedule == 'linear':
+            return base_w * max(0.0, 1.0 - progress)
+        # cosine (default)
+        return base_w * 0.5 * (1.0 + math.cos(math.pi * progress))
+
     def _run_epoch(self, loader: DataLoader, train: bool) -> dict:
         self.model.train(train)
         total_loss = 0.0
@@ -169,14 +186,18 @@ class SpectralTrainer:
         t0 = time.time()
 
         for epoch in range(start_epoch, self.n_epochs + 1):
+            # Update wave weight according to schedule
+            self.criterion.waveform_weight = self._wave_weight(epoch)
+
             train_metrics = self._run_epoch(self.train_dl, train=True)
             val_metrics   = self._run_epoch(self.val_dl,   train=False)
 
             elapsed = time.time() - t0
             lr_now  = self.scheduler.get_last_lr()[0]
 
+            wave_w = self.criterion.waveform_weight
             print(f"\nEpoch {epoch}/{self.n_epochs}  "
-                  f"lr={lr_now:.2e}  elapsed={elapsed:.0f}s")
+                  f"lr={lr_now:.2e}  wave_w={wave_w:.3f}  elapsed={elapsed:.0f}s")
             print(f"  Train — loss={train_metrics['loss']:.4f}  "
                   f"lm={train_metrics['lm_loss']:.4f}  "
                   f"wave={train_metrics['wave_loss']:.4f}")
