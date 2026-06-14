@@ -37,8 +37,12 @@ def main():
     parser.add_argument('--wave-weight',    type=float, default=0.5)
     parser.add_argument('--wave-schedule',  default='cosine',
                         choices=['cosine', 'linear', 'none'],
-                        help='How to anneal waveform loss weight over epochs '
-                             '(cosine: full→0, linear: full→0, none: constant)')
+                        help='How to anneal waveform loss weight over epochs')
+    parser.add_argument('--no-band-init',   action='store_true',
+                        help='Initialize all frequencies uniformly in [0.02,0.50] '
+                             'instead of banded — tests whether structure self-organizes')
+    parser.add_argument('--no-acoustic-init', action='store_true',
+                        help='Random amplitude init instead of character acoustic profiles')
     parser.add_argument('--corpus',      default='data/corpus.txt',
                         help='.txt file with one Python file path per line')
     parser.add_argument('--corpus-dir',  default=None,
@@ -68,6 +72,8 @@ def main():
             'lm_weight':       args.lm_weight,
             'waveform_weight': args.wave_weight,
             'wave_schedule':   args.wave_schedule,
+            'band_init':       not args.no_band_init,
+            'acoustic_init':   not args.no_acoustic_init,
             'band_weights':    [1.5, 1.0, 0.5],
             'weight_decay':    0.01,
         }

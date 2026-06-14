@@ -22,12 +22,14 @@ from ..model.loss import SpectralLoss
 
 def build_model(config: dict, vocab: list) -> SpectralLM:
     return SpectralLM(
-        vocab       = vocab,
-        embed_dim   = config.get('embed_dim',   64),
-        n_layers    = config.get('n_layers',     4),
-        n_heads     = config.get('n_heads',      8),
-        max_seq_len = config.get('max_seq_len', 512),
-        dropout     = config.get('dropout',    0.1),
+        vocab         = vocab,
+        embed_dim     = config.get('embed_dim',     64),
+        n_layers      = config.get('n_layers',       4),
+        n_heads       = config.get('n_heads',        8),
+        max_seq_len   = config.get('max_seq_len',  512),
+        dropout       = config.get('dropout',      0.1),
+        band_init     = config.get('band_init',    True),
+        acoustic_init = config.get('acoustic_init', True),
     )
 
 
@@ -130,11 +132,13 @@ class SpectralTrainer:
                 # Forward
                 out = self.model(token_ids, position_ids, mode=self.mode)
 
-                # For waveform target: compute embedding of full sequence
-                # (shift by 1 to get next-token waveform)
+                # Waveform target: amplitude vector of each token (embed_dim, not 2D).
+                # Predicting the full waveform after cosine-normalization degenerates to
+                # phase prediction (trivially solved by phase advance). Amplitude-only
+                # target requires token identity prediction, which is the intended task.
                 if self.mode in ('waveform', 'joint'):
                     with torch.no_grad():
-                        full_wave = self.model.embedding(token_ids, position_ids)
+                        full_wave = self.model.embedding.amplitude(token_ids)
                 else:
                     full_wave = None
 

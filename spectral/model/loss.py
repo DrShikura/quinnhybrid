@@ -22,17 +22,15 @@ import torch.nn.functional as F
 
 class BandedWaveformLoss(nn.Module):
     """
-    Waveform completion loss computed per frequency band.
+    Amplitude-band cosine loss for the waveform completion task.
 
-    The [real|imag] waveform has shape (B, T, 2*embed_dim).
-    We split the embed_dim dimensions into bands and compute
-    cosine similarity loss within each band independently.
-
-    This forces the model to maintain meaningful signal in ALL bands,
-    not just the easiest one to learn.
+    Operates on amplitude vectors (B, T, embed_dim) — NOT the full [real|imag]
+    waveform. The full waveform was abandoned because F.normalize removes amplitude
+    information, reducing the loss to a trivial phase-prediction task. Predicting
+    the amplitude fingerprint of the next token requires actual token identity.
 
     Args:
-        embed_dim:      per-modality embedding dim
+        embed_dim:      per-modality embedding dim (target shape: B, T, embed_dim)
         structural_end: last structural-band dimension index
         expr_end:       last expression-band dimension index
         band_weights:   (structural_w, expr_w, semantic_w) — loss weights per band
@@ -47,27 +45,15 @@ class BandedWaveformLoss(nn.Module):
     ):
         super().__init__()
         self.embed_dim      = embed_dim
-        self.dim            = 2 * embed_dim
         self.structural_end = structural_end
         self.expr_end       = expr_end
         self.band_weights   = band_weights
 
-        # Band slices in [real|imag] concatenated space
-        # real part occupies dims [0:embed_dim], imag [embed_dim:2*embed_dim]
-        # structural band: real[0:structural_end] + imag[0:structural_end]
+        # Band slices in amplitude (D-dim) space
         self.band_slices = {
-            'structural': (
-                list(range(0, structural_end)) +
-                list(range(embed_dim, embed_dim + structural_end))
-            ),
-            'expression': (
-                list(range(structural_end, expr_end)) +
-                list(range(embed_dim + structural_end, embed_dim + expr_end))
-            ),
-            'semantic': (
-                list(range(expr_end, embed_dim)) +
-                list(range(embed_dim + expr_end, 2 * embed_dim))
-            ),
+            'structural': list(range(0, structural_end)),
+            'expression': list(range(structural_end, expr_end)),
+            'semantic':   list(range(expr_end, embed_dim)),
         }
 
     def _cosine_loss(self, pred: torch.Tensor, target: torch.Tensor,
@@ -184,14 +170,13 @@ class SpectralLoss(nn.Module):
             losses['lm'] = lm_loss
             total = total + self.lm_weight * lm_loss
 
-        # Waveform completion loss
+        # Amplitude completion loss — predict amp[t+1] from hidden state at t.
+        # target_wave is (B, T, embed_dim) amplitude vectors (not full waveform).
         if mode in ('waveform', 'joint') and 'waveform' in model_out and target_wave is not None:
-            pred_wave = model_out['waveform']   # (B, T, 2D)
-
-            # Mask out padding
+            pred_amp = model_out['waveform']   # (B, T, embed_dim)
             pad_mask = (target_ids != pad_id).float()   # (B, T)
 
-            wave_losses = self.waveform_loss(pred_wave[:, :-1], target_wave[:, 1:],
+            wave_losses = self.waveform_loss(pred_amp[:, :-1], target_wave[:, 1:],
                                               mask=pad_mask[:, 1:])
             losses.update({f'wave_{k}': v for k, v in wave_losses.items()})
             total = total + self.waveform_weight * wave_losses['total']

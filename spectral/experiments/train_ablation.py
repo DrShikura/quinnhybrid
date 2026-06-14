@@ -61,8 +61,10 @@ def main():
         'n_epochs':        args.epochs,
         'lr':              args.lr,
         'lm_weight':       1.0,
-        'waveform_weight': 0.0,   # unused in lm mode
+        'waveform_weight': 0.0,
         'wave_schedule':   'none',
+        'band_init':       True,    # same init as joint model for fair comparison
+        'acoustic_init':   True,
         'band_weights':    [1.5, 1.0, 0.5],
         'weight_decay':    0.01,
     }

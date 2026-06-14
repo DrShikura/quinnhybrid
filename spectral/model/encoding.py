@@ -1,26 +1,29 @@
 """
-SpectralEmbedding: character-composed token initialization + MoPE positional encoding.
+SpectralEmbedding: character-composed token initialization + learned sinusoidal PE.
 
 Design principles:
-  1. Character-level composition:
+  1. Character-level composition (optional, --no-acoustic-init to disable):
        Each token's amplitude profile is derived from the characters that spell it.
        Characters map to frequency bands by acoustic class (vowel/stop/fricative/etc).
        This gives every token a unique spectral fingerprint before any training.
 
-  2. MoPE (Morlet Positional Encoding):
-       Each embedding dimension d has TWO learned parameters:
-         f[d]:  frequency   — how fast phase advances with position
-         s[d]:  log-sigma   — locality bandwidth (large = global, small = localized)
-       basis(pos, d) = exp(i * f[d] * pos / max_len * 2π)
-                     * exp(-pos² / (2 * sigma[d]²))   [Gaussian locality]
+  2. Learned per-dimension frequency (MoPE-inspired):
+       Each embedding dimension d has ONE learned parameter:
+         f[d]:  frequency — how fast phase advances with position
+       basis(pos, d) = amp[d] * exp(i * f[d] * pos / max_len * 2π)
 
-       Low-freq dims (0..L):   large sigma → global structural waves
-       High-freq dims (H..D):  small sigma → localized semantic perturbations
+       The Gaussian locality envelope (Morlet) has been removed. It was centered at
+       position 0, making the semantic band (small init σ) essentially dead past
+       position ~50 — a bug, not a feature. Multi-scale locality should live in the
+       attention mechanism (ALiBi-style), not the embedding.
 
-  3. Frequency band partitioning:
-       dims  0 .. STRUCTURAL_END:   structural band  (nesting, control flow)
-       dims  STRUCTURAL_END .. EXPR_END:  expression band  (statements, clauses)
-       dims  EXPR_END .. embed_dim:  semantic band  (individual tokens)
+  3. Frequency band partitioning (optional, --no-band-init to disable):
+       dims  0 .. STRUCTURAL_END:   structural band  (low freq, global patterns)
+       dims  STRUCTURAL_END .. EXPR_END:  expression band  (mid freq)
+       dims  EXPR_END .. embed_dim:  semantic band  (high freq, local patterns)
+
+       Without band_init, all frequencies initialized uniformly across [0.02, 0.50]
+       — use this to test whether band structure self-organizes under LM pressure.
 """
 
 import math
@@ -29,26 +32,21 @@ import torch.nn as nn
 
 
 # ── Character acoustic classes ─────────────────────────────────────────────────
-# Maps characters to their dominant frequency class.
-# Based on approximate acoustic phonetic properties.
 
 _VOWELS      = set("aeiouAEIOU")
 _STOPS       = set("bdgkptBDGKPT")
 _FRICATIVES  = set("fsvzFSVZ")
 _SONORANTS   = set("lmnrLMNR")
 _APPROXIMANT = set("wyhWYH")
-_OTHER       = set("_-0123456789")   # underscores, digits, etc.
 
-# Relative amplitude weight per frequency band for each acoustic class
-#   (structural_weight, expression_weight, semantic_weight)
 _CHAR_BAND_WEIGHTS = {
-    "vowel":       (0.6, 0.3, 0.1),   # vowels: low-freq resonance dominant
-    "sonorant":    (0.3, 0.5, 0.2),   # l/m/n/r: mid-freq
-    "approximant": (0.5, 0.3, 0.2),   # w/y/h: low-mid
-    "stop":        (0.1, 0.2, 0.7),   # d/t/p/k: high-freq burst
-    "fricative":   (0.1, 0.2, 0.7),   # f/s/v/z: high-freq noise
-    "digit":       (0.2, 0.4, 0.4),   # digits: mid-distributed
-    "other":       (0.3, 0.4, 0.3),   # default: flat-ish
+    "vowel":       (0.6, 0.3, 0.1),
+    "sonorant":    (0.3, 0.5, 0.2),
+    "approximant": (0.5, 0.3, 0.2),
+    "stop":        (0.1, 0.2, 0.7),
+    "fricative":   (0.1, 0.2, 0.7),
+    "digit":       (0.2, 0.4, 0.4),
+    "other":       (0.3, 0.4, 0.3),
 }
 
 
@@ -66,22 +64,15 @@ def char_spectral_profile(token_str: str, embed_dim: int,
                            structural_end: int, expr_end: int) -> torch.Tensor:
     """
     Compute a spectral amplitude profile for a token from its characters.
-
-    Returns a real-valued tensor of shape (embed_dim,) representing the
-    initial amplitude distribution across frequency bands.
+    Returns (embed_dim,) real tensor. Note: this provides useful signal for
+    alphabetic keywords but is essentially flat for operators (`:=`, `->`, `**`).
     """
     if not token_str or token_str.startswith("<"):
-        # Special/abstract tokens: flat initialization
         return torch.ones(embed_dim) * 0.02
 
-    # Accumulate band weights across characters
-    structural_w = 0.0
-    expr_w       = 0.0
-    semantic_w   = 0.0
-
+    structural_w = expr_w = semantic_w = 0.0
     for ch in token_str:
-        cls = _char_class(ch)
-        sw, ew, semw = _CHAR_BAND_WEIGHTS[cls]
+        sw, ew, semw = _CHAR_BAND_WEIGHTS[_char_class(ch)]
         structural_w += sw
         expr_w       += ew
         semantic_w   += semw
@@ -91,68 +82,61 @@ def char_spectral_profile(token_str: str, embed_dim: int,
     expr_w       /= n
     semantic_w   /= n
 
-    # Build amplitude profile: each band gets its weight distributed
-    # uniformly across its dimensions, with small Gaussian noise for diversity
     profile = torch.zeros(embed_dim)
+    n_s = structural_end
+    n_e = expr_end - structural_end
+    n_m = embed_dim - expr_end
 
-    n_structural = structural_end
-    n_expr       = expr_end - structural_end
-    n_semantic   = embed_dim - expr_end
+    if n_s > 0: profile[:structural_end]         = structural_w / math.sqrt(n_s)
+    if n_e > 0: profile[structural_end:expr_end] = expr_w       / math.sqrt(n_e)
+    if n_m > 0: profile[expr_end:]               = semantic_w   / math.sqrt(n_m)
 
-    if n_structural > 0:
-        profile[:structural_end]      = structural_w / math.sqrt(n_structural)
-    if n_expr > 0:
-        profile[structural_end:expr_end] = expr_w    / math.sqrt(n_expr)
-    if n_semantic > 0:
-        profile[expr_end:]             = semantic_w  / math.sqrt(n_semantic)
-
-    # Scale to small magnitude (training will adjust)
-    profile = profile * 0.02
-
-    return profile
+    return profile * 0.02
 
 
 class SpectralEmbedding(nn.Module):
     """
-    Token embedding with character-composed initialization and MoPE positional encoding.
+    Token embedding with learned amplitude per token and learned sinusoidal PE.
 
-    Forward input:
-        tokens:    (B, T) long  — token indices
-        positions: (B, T) long  — position indices
+    For each token t at position p and embedding dimension d:
+        real[d] = amp[t,d] * cos(f[d] * p / max_len * 2π)
+        imag[d] = amp[t,d] * sin(f[d] * p / max_len * 2π)
 
-    Forward output:
-        (B, T, embed_dim) real  — concatenated [real; imag] of complex waveform,
-                                  suitable as input to standard attention layers
+    Output: (B, T, 2*embed_dim) concatenated [real | imag].
+
+    Args:
+        band_init:     if True, initialize frequencies in three bands
+                       (structural=low, expression=mid, semantic=high).
+                       if False, initialize uniformly in [0.02, 0.50] — use this
+                       to test whether frequency structure self-organizes.
+        acoustic_init: if True, initialize amplitude from character acoustic profiles.
+                       if False, use default PyTorch random init.
     """
 
-    STRUCTURAL_FRAC = 0.25   # fraction of dims in structural band
-    EXPR_FRAC       = 0.50   # fraction of dims in structural + expression
+    STRUCTURAL_FRAC = 0.25
+    EXPR_FRAC       = 0.50
 
     def __init__(self, vocab_size: int, embed_dim: int, max_seq_len: int,
-                 vocab: list):
+                 vocab: list, band_init: bool = True, acoustic_init: bool = True):
         super().__init__()
         self.vocab_size  = vocab_size
         self.embed_dim   = embed_dim
         self.max_seq_len = max_seq_len
 
-        # Band boundaries
         self.structural_end = max(1, int(embed_dim * self.STRUCTURAL_FRAC))
         self.expr_end       = max(self.structural_end + 1,
                                   int(embed_dim * self.EXPR_FRAC))
 
-        # ── Amplitude (token identity) ──────────────────────────────────────
-        # Initialized from character spectral profiles, then learned
         self.amplitude = nn.Embedding(vocab_size, embed_dim)
-        self._init_amplitudes(vocab)
+        if acoustic_init:
+            self._init_amplitudes(vocab)
 
-        # ── MoPE parameters (positional encoding) ──────────────────────────
-        # f[d]: frequency per dimension — initialized to cover full range
-        # log_sigma[d]: log-bandwidth — initialized by band
-        self.freq      = nn.Parameter(self._init_frequencies())
-        self.log_sigma = nn.Parameter(self._init_log_sigmas())
+        self.freq = nn.Parameter(
+            self._init_frequencies_banded() if band_init
+            else torch.rand(embed_dim) * 0.48 + 0.02
+        )
 
     def _init_amplitudes(self, vocab: list):
-        """Initialize amplitude embeddings from character spectral profiles."""
         with torch.no_grad():
             for idx, token_str in enumerate(vocab):
                 profile = char_spectral_profile(
@@ -161,91 +145,26 @@ class SpectralEmbedding(nn.Module):
                 )
                 self.amplitude.weight[idx] = profile
 
-    def _init_frequencies(self) -> torch.Tensor:
-        """
-        Initialize frequencies hierarchically by band.
-
-        Structural band:  low frequencies  (slow global oscillation)
-        Expression band:  mid frequencies
-        Semantic band:    high frequencies (fast local oscillation)
-        """
+    def _init_frequencies_banded(self) -> torch.Tensor:
+        """Partition frequency range into three bands by dim index."""
         freqs = torch.zeros(self.embed_dim)
-
-        # Structural: f in [0.02, 0.10]
         n_s = self.structural_end
         freqs[:n_s] = torch.linspace(0.02, 0.10, n_s)
-
-        # Expression: f in [0.10, 0.25]
         n_e = self.expr_end - self.structural_end
         freqs[self.structural_end:self.expr_end] = torch.linspace(0.10, 0.25, n_e)
-
-        # Semantic: f in [0.25, 0.50]
         n_sem = self.embed_dim - self.expr_end
         freqs[self.expr_end:] = torch.linspace(0.25, 0.50, n_sem)
-
         return freqs
-
-    def _init_log_sigmas(self) -> torch.Tensor:
-        """
-        Initialize locality bandwidths by band.
-
-        Structural band:  large sigma → global (active everywhere)
-        Expression band:  medium sigma
-        Semantic band:    small sigma → localized perturbations
-        """
-        log_sigmas = torch.zeros(self.embed_dim)
-
-        # Structural: sigma ≈ max_seq_len (global)
-        log_sigmas[:self.structural_end] = math.log(self.max_seq_len)
-
-        # Expression: sigma ≈ max_seq_len / 4
-        log_sigmas[self.structural_end:self.expr_end] = math.log(
-            self.max_seq_len / 4
-        )
-
-        # Semantic: sigma ≈ max_seq_len / 16 (localized)
-        log_sigmas[self.expr_end:] = math.log(
-            max(1, self.max_seq_len / 16)
-        )
-
-        return log_sigmas
 
     def forward(self, tokens: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
         """
-        Compute spectral embeddings.
-
-        Returns (B, T, 2*embed_dim) real tensor — [real_part | imag_part]
-        concatenated along last dim so standard linear layers can process it.
+        Returns (B, T, 2*embed_dim): [amp*cos(phase) | amp*sin(phase)].
         """
         B, T = tokens.shape
-
-        # Token amplitude: (B, T, D)
-        amp = self.amplitude(tokens)  # real, (B, T, D)
-
-        # MoPE positional basis
-        # pos_f: (B, T, 1) normalized positions
-        pos_f = positions.float().unsqueeze(-1) / self.max_seq_len  # (B, T, 1)
-
-        # Phase: f[d] * pos * 2π  →  (B, T, D)
-        phase = self.freq.unsqueeze(0).unsqueeze(0) * pos_f * 2 * math.pi
-
-        # Gaussian locality envelope: exp(-pos² / (2σ²))
-        # Center Gaussian at pos=0 (start of sequence) for global dims,
-        # and let sigma determine reach. For large sigma (structural band),
-        # envelope ≈ 1.0 everywhere. For small sigma (semantic), falls off fast.
-        sigma  = torch.exp(self.log_sigma)                    # (D,)
-        pos_sq = (positions.float() ** 2).unsqueeze(-1)       # (B, T, 1)
-        envelope = torch.exp(
-            -pos_sq / (2 * sigma.unsqueeze(0).unsqueeze(0) ** 2 + 1e-6)
-        )                                                      # (B, T, D)
-
-        # Complex waveform: amp * envelope * exp(i*phase)
-        # Real part: amp * envelope * cos(phase)
-        # Imag part: amp * envelope * sin(phase)
-        modulated = amp * envelope                            # (B, T, D)
-        real_part = modulated * torch.cos(phase)             # (B, T, D)
-        imag_part = modulated * torch.sin(phase)             # (B, T, D)
-
-        # Concatenate to (B, T, 2D) for use with real-valued attention
-        return torch.cat([real_part, imag_part], dim=-1)     # (B, T, 2D)
+        amp   = self.amplitude(tokens)                                  # (B, T, D)
+        pos_f = positions.float().unsqueeze(-1) / self.max_seq_len      # (B, T, 1)
+        phase = self.freq.unsqueeze(0).unsqueeze(0) * pos_f * 2 * math.pi  # (B, T, D)
+        real_part = amp * torch.cos(phase)                              # (B, T, D)
+        imag_part = amp * torch.sin(phase)                              # (B, T, D)
+        return torch.cat([real_part, imag_part], dim=-1)               # (B, T, 2D)

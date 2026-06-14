@@ -87,12 +87,14 @@ class SpectralLM(nn.Module):
 
     def __init__(
         self,
-        vocab:       list,
-        embed_dim:   int = 64,
-        n_layers:    int = 4,
-        n_heads:     int = 8,
-        max_seq_len: int = 512,
-        dropout:     float = 0.1,
+        vocab:        list,
+        embed_dim:    int = 64,
+        n_layers:     int = 4,
+        n_heads:      int = 8,
+        max_seq_len:  int = 512,
+        dropout:      float = 0.1,
+        band_init:    bool = True,
+        acoustic_init: bool = True,
     ):
         super().__init__()
 
@@ -105,10 +107,12 @@ class SpectralLM(nn.Module):
 
         # ── Embedding ────────────────────────────────────────────────────────
         self.embedding = SpectralEmbedding(
-            vocab_size  = self.vocab_size,
-            embed_dim   = embed_dim,
-            max_seq_len = max_seq_len,
-            vocab       = vocab,
+            vocab_size    = self.vocab_size,
+            embed_dim     = embed_dim,
+            max_seq_len   = max_seq_len,
+            vocab         = vocab,
+            band_init     = band_init,
+            acoustic_init = acoustic_init,
         )
 
         # ── Transformer ──────────────────────────────────────────────────────
@@ -119,10 +123,13 @@ class SpectralLM(nn.Module):
         self.norm = nn.LayerNorm(self.dim)
 
         # ── Heads ────────────────────────────────────────────────────────────
-        # Waveform completion head: predict next-token waveform
-        self.waveform_head = nn.Linear(self.dim, self.dim)
+        # Waveform head: predict next token's amplitude vector (embed_dim, not 2*embed_dim).
+        # Target is amp[t+1], not the full waveform — cosine loss on amplitude is
+        # meaningful (different tokens have different spectral fingerprints).
+        # Predicting the full waveform after F.normalize degenerates to phase prediction.
+        self.waveform_head = nn.Linear(self.dim, embed_dim)
 
-        # Language model head: predict next-token id
+        # LM head: predict next-token id
         self.lm_head = nn.Linear(self.dim, self.vocab_size)
 
         self._init_output_heads()
