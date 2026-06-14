@@ -35,7 +35,11 @@ def main():
     parser.add_argument('--lr',          type=float, default=3e-4)
     parser.add_argument('--lm-weight',   type=float, default=1.0)
     parser.add_argument('--wave-weight', type=float, default=0.5)
-    parser.add_argument('--corpus',      default='data/corpus.txt')
+    parser.add_argument('--corpus',      default='data/corpus.txt',
+                        help='.txt file with one Python file path per line')
+    parser.add_argument('--corpus-dir',  default=None,
+                        help='Directory to recursively search for .py files '
+                             '(overrides --corpus if provided)')
     parser.add_argument('--checkpoint-dir', default='checkpoints/spectral_small')
     parser.add_argument('--resume',      default=None,
                         help='Path to checkpoint to resume from')
@@ -66,10 +70,11 @@ def main():
     # Allow overriding epoch count even when resuming
     config['n_epochs'] = args.epochs
 
-    print("Loading corpus...")
-    train_ds = SpectralDataset(args.corpus, tokenizer,
+    corpus_source = args.corpus_dir if args.corpus_dir else args.corpus
+    print(f"Loading corpus from: {corpus_source}")
+    train_ds = SpectralDataset(corpus_source, tokenizer,
                                 max_seq_len=config['max_seq_len'], split='train')
-    val_ds   = SpectralDataset(args.corpus, tokenizer,
+    val_ds   = SpectralDataset(corpus_source, tokenizer,
                                 max_seq_len=config['max_seq_len'], split='val')
 
     pad_id  = tokenizer.pad_id

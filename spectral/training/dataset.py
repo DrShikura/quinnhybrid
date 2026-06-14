@@ -46,14 +46,27 @@ class SpectralDataset(Dataset):
         self.tokenizer   = tokenizer or PythonStructuralTokenizer()
         self.max_seq_len = max_seq_len
 
-        # Load file paths
+        # Load file paths — accepts:
+        #   - a .txt file with one path per line
+        #   - a directory (recursively finds all .py files)
+        #   - a list of paths
         if isinstance(file_list, (str, Path)):
-            paths = Path(file_list).read_text().splitlines()
-            paths = [Path(p.strip()) for p in paths if p.strip()]
+            p = Path(file_list)
+            if p.is_dir():
+                paths = sorted(p.rglob('*.py'))
+            else:
+                lines = p.read_text(encoding='utf-8', errors='replace').splitlines()
+                paths = [Path(ln.strip()) for ln in lines if ln.strip()]
         else:
             paths = [Path(p) for p in file_list]
 
         paths = [p for p in paths if p.exists()]
+        if not paths:
+            raise FileNotFoundError(
+                f"No Python files found from corpus source: {file_list}\n"
+                f"  Use --corpus-dir to point at a directory of .py files, "
+                f"or --corpus for a file-list .txt."
+            )
 
         # Tokenize all files
         all_samples: List[List[int]] = []
