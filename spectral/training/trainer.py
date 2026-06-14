@@ -89,13 +89,19 @@ class SpectralTrainer:
         total_steps     = self.n_epochs * steps_per_epoch
         warmup_steps    = config.get('warmup_steps', min(500, total_steps // 10))
 
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr          = self.lr,
-            total_steps     = total_steps,
-            pct_start       = warmup_steps / total_steps,
-            anneal_strategy = 'cos',
-        )
+        if total_steps >= 20:
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr          = self.lr,
+                total_steps     = total_steps,
+                pct_start       = max(warmup_steps / total_steps, 1 / total_steps),
+                anneal_strategy = 'cos',
+            )
+        else:
+            # OneCycleLR divides by zero with very few steps; use cosine fallback
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=max(total_steps, 1), eta_min=self.lr * 0.01
+            )
 
         self.history = []
 
