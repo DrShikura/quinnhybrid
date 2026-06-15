@@ -68,6 +68,8 @@ def main():
     parser.add_argument('--device',      default='auto',
                         choices=['auto', 'cpu', 'cuda', 'mps'],
                         help='Device to train on (default: auto-detect)')
+    parser.add_argument('--no-compile',  action='store_true',
+                        help='Disable torch.compile (needed for older GPUs < SM 7.0)')
     args = parser.parse_args()
 
     if args.device == 'auto':
@@ -138,7 +140,7 @@ def main():
     model = build_model(config, tokenizer.vocab,
                         laplacian_eigvecs=laplacian_eigvecs)
 
-    if device.type == 'cuda' and hasattr(torch, 'compile'):
+    if device.type == 'cuda' and hasattr(torch, 'compile') and not args.no_compile:
         print("Compiling model with torch.compile(mode='reduce-overhead')...")
         model = torch.compile(model, mode='reduce-overhead')
 
