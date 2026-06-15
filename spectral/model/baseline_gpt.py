@@ -72,9 +72,10 @@ class BaselineGPT(nn.Module):
         dropout:     float = 0.1,
     ):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.d_model    = d_model
-        self.n_loops    = n_layers   # trainer compatibility (used in print)
+        self.vocab_size  = vocab_size
+        self.d_model     = d_model
+        self.n_loops     = n_layers     # trainer compatibility
+        self.max_seq_len = max_seq_len  # generate() compatibility
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.register_buffer('pe', _sinusoidal_pe(max_seq_len, d_model))

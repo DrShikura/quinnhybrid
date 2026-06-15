@@ -97,7 +97,8 @@ def generate(
 
     for step in range(max_new):
         # Truncate to model's max_seq_len
-        ctx = generated[-model.embedding.max_seq_len:]
+        _max = getattr(model, 'max_seq_len', None) or model.embedding.max_seq_len
+        ctx = generated[-_max:]
 
         tokens    = torch.tensor([ctx], dtype=torch.long, device=dev)
         positions = torch.arange(len(ctx), dtype=torch.long, device=dev).unsqueeze(0)
@@ -171,7 +172,8 @@ def generate_beam(
                 candidates.append((score, seq))
                 continue
 
-            ctx       = seq[-model.embedding.max_seq_len:]
+            _max = getattr(model, 'max_seq_len', None) or model.embedding.max_seq_len
+            ctx  = seq[-_max:]
             tokens    = torch.tensor([ctx], dtype=torch.long, device=dev)
             positions = torch.arange(len(ctx), dtype=torch.long, device=dev).unsqueeze(0)
 
