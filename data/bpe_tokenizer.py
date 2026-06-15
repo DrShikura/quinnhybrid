@@ -118,17 +118,19 @@ class BytePairTokenizer:
 
         Args:
             vocab_path: Path to directory containing vocab.json and merges.txt.
-                       If None, uses default structural vocab (no BPE).
+                       If None, falls back to structural roles (same as PythonStructuralTokenizer).
         """
         self.vocab_path = Path(vocab_path) if vocab_path else None
         self.merges: Dict[Tuple[str, str], int] = {}  # (token1, token2) → merge rank
         self.vocab: List[str] = []
         self.vocab_index: Dict[str, int] = {}
+        self._bpe_trained = False  # True when a trained BPE vocab is loaded
 
         if vocab_path and Path(vocab_path).exists():
             self._load_vocab(Path(vocab_path))
+            self._bpe_trained = True
         else:
-            # Fallback to structural vocabulary (no merges, no BPE)
+            # Fallback: structural role vocab (no BPE subwords)
             self._init_structural_vocab()
 
     # ── Initialization ───────────────────────────────────────────────────────
@@ -439,8 +441,8 @@ class BytePairTokenizer:
             best_pair = max(pair_frequencies, key=pair_frequencies.get)
             best_freq = pair_frequencies[best_pair]
 
-            # Merge this pair in all words
-            new_token = best_pair[0] + "##" + best_pair[1]
+            # Merge this pair in all words (no separator, just concatenate)
+            new_token = best_pair[0] + best_pair[1]
             vocab.add(new_token)
             merges.append(best_pair)
 
@@ -531,17 +533,25 @@ class BytePairTokenizer:
             token_id = self._lookup("ENDMARKER")
             return [token_id] if token_id is not None else None
 
-        # Keywords and built-ins
+        # Keywords and built-ins (always atomic)
         if tt == tokenize.NAME:
             if keyword.iskeyword(ts) or ts in ("True", "False", "None"):
                 token_id = self._lookup(ts)
                 return [token_id] if token_id is not None else None
-            # Non-keyword identifier: apply BPE
-            return self._encode_subword(ts)
+
+            if self._bpe_trained:
+                # BPE mode: encode identifier as subword sequence
+                return self._encode_subword(ts)
+            else:
+                # Structural fallback: use role-based NAME_* tokens
+                role = self._determine_name_role(ts, prev_tok, next_tok)
+                return [role]
 
         # Structural tokens
         if tt == tokenize.NUMBER:
-            return self._encode_subword(ts)
+            if self._bpe_trained:
+                return self._encode_subword(ts)
+            return [self._lookup("NUMBER")]
         if tt == tokenize.STRING:
             token_id = self._lookup("STRING")
             return [token_id] if token_id is not None else None
@@ -561,7 +571,9 @@ class BytePairTokenizer:
             token_id = self._lookup("DEDENT")
             return [token_id] if token_id is not None else None
         if tt == tokenize.COMMENT:
-            return self._encode_subword(ts)
+            if self._bpe_trained:
+                return self._encode_subword(ts)
+            return [self._lookup("COMMENT")]
         if hasattr(tokenize, 'TYPE_COMMENT') and tt == tokenize.TYPE_COMMENT:
             token_id = self._lookup("TYPE_COMMENT")
             return [token_id] if token_id is not None else None
@@ -618,6 +630,22 @@ class BytePairTokenizer:
                 result_ids.append(self._lookup("<UNK>"))
 
         return result_ids if result_ids else None
+
+    def _determine_name_role(self, name_str: str, prev_tok, next_tok) -> int:
+        """Structural role for identifier (used when BPE not trained)."""
+        prev_string = prev_tok.string if prev_tok else None
+        next_string = next_tok.string if next_tok else None
+        next_type   = next_tok.type   if next_tok else None
+
+        if prev_string == "class":  return self.vocab_index["NAME_CLASS"]
+        if prev_string == "def":    return self.vocab_index["NAME_FUNC"]
+        if prev_string == ".":      return self.vocab_index["NAME_ATTR"]
+        if next_string == "(":      return self.vocab_index["NAME_CALL"]
+        if next_string == "=" or (next_type == tokenize.OP and next_string in _AUGASSIGN_OPS):
+            return self.vocab_index["NAME_ASSIGN"]
+        if next_string in (")", ","):
+            return self.vocab_index["NAME_PARAM"]
+        return self.vocab_index["NAME_OTHER"]
 
     def _lookup(self, token: str) -> Optional[int]:
         """Look up token ID, return UNK_ID if not found."""
