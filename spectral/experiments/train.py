@@ -17,13 +17,17 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.tokenizer import PythonStructuralTokenizer
-from spectral.model.spectral_lm import SpectralLM
+from spectral.model.baseline_gpt import BaselineGPT
 from spectral.training.dataset import SpectralDataset, collate_fn
 from spectral.training.trainer import SpectralTrainer, build_model
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--model',        default='spectral',
+                        choices=['spectral', 'baseline-1l', 'baseline-2l'],
+                        help='spectral=SpectralLM (default), baseline-1l=GPT d=64 1-layer, '
+                             'baseline-2l=GPT d=48 2-layer')
     parser.add_argument('--mode',        default='joint',
                         choices=['joint', 'lm', 'waveform'])
     parser.add_argument('--epochs',      type=int, default=50)
@@ -136,9 +140,20 @@ def main():
     use_laplacian = config.get('laplacian_init', True)
     laplacian_eigvecs = train_ds.laplacian_eigvecs if use_laplacian else None
 
-    print("\nBuilding SpectralLM...")
-    model = build_model(config, tokenizer.vocab,
-                        laplacian_eigvecs=laplacian_eigvecs)
+    if args.model == 'spectral':
+        print("\nBuilding SpectralLM...")
+        model = build_model(config, tokenizer.vocab,
+                            laplacian_eigvecs=laplacian_eigvecs)
+    elif args.model == 'baseline-1l':
+        print("\nBuilding BaselineGPT (d=64, 1 layer)...")
+        model = BaselineGPT(len(tokenizer.vocab), d_model=64, n_heads=4,
+                            n_layers=1, max_seq_len=config['max_seq_len'])
+        config['mode'] = 'lm'   # baseline has no waveform/memory heads
+    elif args.model == 'baseline-2l':
+        print("\nBuilding BaselineGPT (d=48, 2 layers)...")
+        model = BaselineGPT(len(tokenizer.vocab), d_model=48, n_heads=4,
+                            n_layers=2, max_seq_len=config['max_seq_len'])
+        config['mode'] = 'lm'
 
     if device.type == 'cuda' and hasattr(torch, 'compile') and not args.no_compile:
         print("Compiling model with torch.compile(mode='reduce-overhead')...")

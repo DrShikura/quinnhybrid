@@ -156,8 +156,8 @@ class SpectralTrainer:
 
                 out = self.model(token_ids, position_ids, mode=self.mode)
 
-                # Amplitude target (D-dim, not 2D) avoids phase-prediction degeneracy
-                if self.mode in ('waveform', 'joint'):
+                # Amplitude target — only available for SpectralLM
+                if self.mode in ('waveform', 'joint') and hasattr(self.model, 'embedding') and hasattr(self.model.embedding, 'amplitude'):
                     with torch.no_grad():
                         full_wave = self.model.embedding.amplitude(token_ids)
                 else:
@@ -195,19 +195,26 @@ class SpectralTrainer:
         }
 
     def train(self):
-        counts = self.model.param_count()
-        print(f"\nSpectralLM parameters: {counts['total']:,}")
+        counts     = self.model.param_count()
+        model_name = type(self.model).__name__
+        print(f"\n{model_name} parameters: {counts['total']:,}")
         print(f"  Embedding:   {counts['embedding']:,}")
-        print(f"  Transformer: {counts['transformer']:,}  (1 shared layer × {self.model.n_loops} loops)")
-        print(f"  Memory:      {counts['memory']:,}")
-        print(f"  Heads:       {counts['heads']:,}  (LM head partially tied to amplitude)")
-        print(f"\nMode: {self.mode}   Epochs: {self.n_epochs}   Loops/step: {self.model.n_loops}")
-        emb = self.model.embedding
-        print(f"Structural band: dims 0-{emb.structural_end}")
-        print(f"Expression band: dims {emb.structural_end}-{emb.expr_end}")
-        print(f"Semantic band:   dims {emb.expr_end}-{self.model.embed_dim}")
-        print(f"Gradient consistency loss weight: {self.criterion.gradient_weight:.3f} (constant)")
-        print(f"Memory loss weight:               {self.criterion.memory_weight:.3f} (constant)")
+        n_loops = getattr(self.model, 'n_loops', 1)
+        if counts.get('memory', 0):
+            print(f"  Transformer: {counts['transformer']:,}  (1 shared layer × {n_loops} loops)")
+            print(f"  Memory:      {counts['memory']:,}")
+            print(f"  Heads:       {counts['heads']:,}  (LM head partially tied to amplitude)")
+        else:
+            n_layers = n_loops
+            print(f"  Transformer: {counts['transformer']:,}  ({n_layers} layer{'s' if n_layers > 1 else ''})")
+        print(f"\nMode: {self.mode}   Epochs: {self.n_epochs}   Loops/step: {n_loops}")
+        if hasattr(self.model, 'embedding') and hasattr(self.model.embedding, 'structural_end'):
+            emb = self.model.embedding
+            print(f"Structural band: dims 0-{emb.structural_end}")
+            print(f"Expression band: dims {emb.structural_end}-{emb.expr_end}")
+            print(f"Semantic band:   dims {emb.expr_end}-{self.model.embed_dim}")
+            print(f"Gradient consistency loss weight: {self.criterion.gradient_weight:.3f} (constant)")
+            print(f"Memory loss weight:               {self.criterion.memory_weight:.3f} (constant)")
         print("=" * 60)
 
         start_epoch = getattr(self, '_start_epoch', 1)
@@ -268,19 +275,41 @@ class SpectralTrainer:
             'config':      self.config,
         }, path)
 
-    def resume(self, checkpoint_path: str):
-        """Load model + optimizer + scheduler state to continue training."""
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
-        # strict=False handles new parameters (log_sigma_head) not present in old checkpoints
-        missing, unexpected = self.model.load_state_dict(
-            ckpt['model_state'], strict=False
-        )
+    def resume(self, checkpoint_path: str) -> int:
+        """Load model + optimizer state to continue training.
+
+        The LR scheduler is rebuilt for the remaining epochs rather than
+        restored from the checkpoint — restoring the old scheduler state would
+        overwrite total_steps with the original run's value and cause a
+        ValueError on the first step when training beyond that count.
+        """
+        ckpt = torch.load(checkpoint_path, map_location=self.device,
+                          weights_only=False)
+        missing, _ = self.model.load_state_dict(ckpt['model_state'], strict=False)
         if missing:
-            print(f"  (initializing {len(missing)} new parameters from scratch: "
-                  f"{missing[:3]}{'...' if len(missing)>3 else ''})")
+            print(f"  (initializing {len(missing)} new params: "
+                  f"{missing[:3]}{'...' if len(missing) > 3 else ''})")
         self.optimizer.load_state_dict(ckpt['opt_state'])
-        self.scheduler.load_state_dict(ckpt['sched_state'])
-        self.history    = ckpt.get('history', [])
-        start_epoch     = ckpt['epoch'] + 1
+
+        # Rebuild scheduler for remaining epochs at a reduced peak LR
+        start_epoch      = ckpt['epoch'] + 1
+        remaining_epochs = self.n_epochs - ckpt['epoch']
+        remaining_steps  = max(remaining_epochs * len(self.train_dl), 1)
+        warmup_steps     = min(100, remaining_steps // 10)
+        if remaining_steps >= 20:
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr          = self.lr * 0.3,   # lower peak for continued training
+                total_steps     = remaining_steps,
+                pct_start       = max(warmup_steps / remaining_steps,
+                                      1 / remaining_steps),
+                anneal_strategy = 'cos',
+            )
+        else:
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=remaining_steps, eta_min=self.lr * 0.01
+            )
+
+        self.history = ckpt.get('history', [])
         print(f"Resumed from epoch {ckpt['epoch']}  val_loss={ckpt['val_loss']:.4f}")
         return start_epoch
