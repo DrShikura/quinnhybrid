@@ -65,6 +65,7 @@ class SpectralTrainer:
         checkpoint_dir: str | Path,
         tokenizer,
         frozen_entropy: 'torch.Tensor | None' = None,
+        device: 'torch.device | None' = None,
     ):
         self.model    = model
         self.train_dl = train_loader
@@ -74,8 +75,15 @@ class SpectralTrainer:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         self.tokenizer = tokenizer
 
-        self.mode   = config.get('mode', 'joint')
-        self.device = torch.device('cpu')
+        self.mode = config.get('mode', 'joint')
+        if device is not None:
+            self.device = device
+        elif torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            self.device = torch.device('mps')
+        else:
+            self.device = torch.device('cpu')
         self.model.to(self.device)
 
         # Frozen entropy tensor on same device

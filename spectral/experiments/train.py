@@ -65,7 +65,21 @@ def main():
     parser.add_argument('--checkpoint-dir', default='checkpoints/spectral_small')
     parser.add_argument('--resume',      default=None,
                         help='Path to checkpoint to resume from')
+    parser.add_argument('--device',      default='auto',
+                        choices=['auto', 'cpu', 'cuda', 'mps'],
+                        help='Device to train on (default: auto-detect)')
     args = parser.parse_args()
+
+    if args.device == 'auto':
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
+    else:
+        device = torch.device(args.device)
+    print(f"Device: {device}")
 
     tokenizer = PythonStructuralTokenizer()
 
@@ -108,10 +122,13 @@ def main():
     pad_id  = tokenizer.pad_id
     collate = partial(collate_fn, pad_id=pad_id)
 
+    pin = device.type == 'cuda'
     train_dl = DataLoader(train_ds, batch_size=args.batch_size,
-                          shuffle=True,  collate_fn=collate, num_workers=0)
+                          shuffle=True,  collate_fn=collate, num_workers=0,
+                          pin_memory=pin)
     val_dl   = DataLoader(val_ds,   batch_size=args.batch_size,
-                          shuffle=False, collate_fn=collate, num_workers=0)
+                          shuffle=False, collate_fn=collate, num_workers=0,
+                          pin_memory=pin)
 
     # Laplacian eigenvectors for amplitude initialization (can be disabled)
     use_laplacian = config.get('laplacian_init', True)
@@ -129,6 +146,7 @@ def main():
         checkpoint_dir = args.checkpoint_dir,
         tokenizer      = tokenizer,
         frozen_entropy = train_ds.frozen_entropy,
+        device         = device,
     )
 
     if args.resume:
