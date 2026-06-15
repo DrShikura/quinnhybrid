@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.tokenizer import PythonStructuralTokenizer
 from spectral.model.baseline_gpt import BaselineGPT
+from spectral.model.wave_gpt import WaveGPT
 from spectral.training.dataset import SpectralDataset, collate_fn
 from spectral.training.trainer import SpectralTrainer, build_model
 
@@ -25,9 +26,9 @@ from spectral.training.trainer import SpectralTrainer, build_model
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',        default='spectral',
-                        choices=['spectral', 'baseline-1l', 'baseline-2l'],
+                        choices=['spectral', 'baseline-1l', 'baseline-2l', 'wave-gpt'],
                         help='spectral=SpectralLM (default), baseline-1l=GPT d=64 1-layer, '
-                             'baseline-2l=GPT d=48 2-layer')
+                             'baseline-2l=GPT d=48 2-layer, wave-gpt=WaveGPT (ALiBi+phase)')
     parser.add_argument('--mode',        default='joint',
                         choices=['joint', 'lm', 'waveform'])
     parser.add_argument('--epochs',      type=int, default=50)
@@ -72,6 +73,9 @@ def main():
     parser.add_argument('--device',      default='auto',
                         choices=['auto', 'cpu', 'cuda', 'mps'],
                         help='Device to train on (default: auto-detect)')
+    parser.add_argument('--ff-mult',      type=int,   default=3,
+                        help='WaveGPT feedforward multiplier: hidden = ff_mult × d_model '
+                             '(default 3; use 4 to match standard GPT)')
     parser.add_argument('--no-compile',  action='store_true',
                         help='Disable torch.compile (needed for older GPUs < SM 7.0)')
     args = parser.parse_args()
@@ -98,6 +102,7 @@ def main():
             'mode':              args.mode,
             'embed_dim':         args.embed_dim,
             'n_loops':           args.n_loops,
+            'n_layers':          args.n_layers,
             'n_heads':           args.n_heads,
             'max_seq_len':       args.max_seq_len,
             'n_epochs':          args.epochs,
@@ -115,6 +120,7 @@ def main():
             'band_weights':      [1.5, 1.0, 0.5],
             'weight_decay':      0.01,
             'model_type':        args.model,
+            'ff_mult':           args.ff_mult,
         }
 
     config['n_epochs'] = args.epochs
@@ -155,6 +161,21 @@ def main():
         model = BaselineGPT(len(tokenizer.vocab), d_model=48, n_heads=4,
                             n_layers=2, max_seq_len=config['max_seq_len'])
         config['mode'] = 'lm'
+    elif args.model == 'wave-gpt':
+        # Default d=48 for wave-gpt (user can override with --embed-dim)
+        d       = args.embed_dim if args.embed_dim != 32 else 48
+        n_lay   = args.n_layers
+        ff_mult = args.ff_mult
+        print(f"\nBuilding WaveGPT (d={d}, {n_lay} layers, ff_mult={ff_mult}, ALiBi+phase)...")
+        model = WaveGPT(
+            len(tokenizer.vocab),
+            d_model=d, n_heads=config['n_heads'],
+            n_layers=n_lay, max_seq_len=config['max_seq_len'],
+            ff_mult=ff_mult,
+        )
+        config['mode']      = 'lm'
+        config['embed_dim'] = d
+        config['d_model']   = d
 
     if device.type == 'cuda' and hasattr(torch, 'compile') and not args.no_compile:
         print("Compiling model with torch.compile(mode='reduce-overhead')...")

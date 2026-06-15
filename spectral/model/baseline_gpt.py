@@ -90,6 +90,14 @@ class BaselineGPT(nn.Module):
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight
 
+        # std=0.02 prevents the epoch-1 loss spike from default N(0,1) embedding init
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(
         self,
         tokens:    torch.Tensor,    # (B, T) long

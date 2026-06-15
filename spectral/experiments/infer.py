@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.tokenizer import PythonStructuralTokenizer
 from spectral.model.baseline_gpt import BaselineGPT
+from spectral.model.wave_gpt import WaveGPT
 from spectral.training.trainer import build_model
 from spectral.model.generate import generate, generate_beam
 
@@ -31,6 +32,16 @@ def load_from_checkpoint(checkpoint_path: str, model_override: str = 'auto'):
 
     if model_type == 'spectral':
         model = build_model(config, tokenizer.vocab)
+    elif model_type == 'wave-gpt':
+        d = config.get('d_model', config.get('embed_dim', 48))
+        model = WaveGPT(
+            len(tokenizer.vocab),
+            d_model     = d,
+            n_heads     = config.get('n_heads', 4),
+            n_layers    = config.get('n_layers', config.get('n_loops', 2)),
+            max_seq_len = config.get('max_seq_len', 256),
+            ff_mult     = config.get('ff_mult', 3),
+        )
     else:
         d, n = (64, 1) if model_type == 'baseline-1l' else (48, 2)
         model = BaselineGPT(len(tokenizer.vocab), d_model=d, n_heads=4,
@@ -48,7 +59,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--model',      default='auto',
-                        choices=['auto', 'spectral', 'baseline-1l', 'baseline-2l'],
+                        choices=['auto', 'spectral', 'baseline-1l', 'baseline-2l', 'wave-gpt'],
                         help='Model type (default: auto-detect from checkpoint)')
     parser.add_argument('--prompt',     default='def ')
     parser.add_argument('--max-new',    type=int,   default=100)
