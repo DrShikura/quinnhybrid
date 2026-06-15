@@ -490,9 +490,9 @@ class BytePairTokenizer:
         for i, tok in enumerate(tokens):
             prev_tok = tokens[i - 1] if i > 0 else None
             next_tok = tokens[i + 1] if i < len(tokens) - 1 else None
-            tok_id = self._map_token_with_context(tok, prev_tok, next_tok)
-            if tok_id is not None:
-                ids.append(tok_id)
+            tok_ids = self._map_token_with_context(tok, prev_tok, next_tok)
+            if tok_ids is not None:
+                ids.extend(tok_ids)
 
         if add_special:
             ids.append(self.eos_id)
@@ -513,26 +513,29 @@ class BytePairTokenizer:
                 pass
         return all_toks
 
-    def _map_token_with_context(self, tok, prev_tok, next_tok) -> Optional[int]:
+    def _map_token_with_context(self, tok, prev_tok, next_tok) -> Optional[List[int]]:
         """
-        Map a tokenize.TokenInfo to a token ID.
+        Map a tokenize.TokenInfo to a list of token IDs.
 
-        For atomic tokens (keywords, brackets, operators): direct lookup.
-        For subword-able tokens (identifiers, strings, numbers): apply BPE.
+        For atomic tokens (keywords, brackets, operators): return [single_id].
+        For subword-able tokens (identifiers, strings, numbers): apply BPE, return sequence.
         """
         tt = tok.type
         ts = tok.string
 
         # Special tokens
         if tt == tokenize.ENCODING:
-            return self._lookup("ENCODING")
+            token_id = self._lookup("ENCODING")
+            return [token_id] if token_id is not None else None
         if tt == tokenize.ENDMARKER:
-            return self._lookup("ENDMARKER")
+            token_id = self._lookup("ENDMARKER")
+            return [token_id] if token_id is not None else None
 
         # Keywords and built-ins
         if tt == tokenize.NAME:
             if keyword.iskeyword(ts) or ts in ("True", "False", "None"):
-                return self._lookup(ts)
+                token_id = self._lookup(ts)
+                return [token_id] if token_id is not None else None
             # Non-keyword identifier: apply BPE
             return self._encode_subword(ts)
 
@@ -540,63 +543,81 @@ class BytePairTokenizer:
         if tt == tokenize.NUMBER:
             return self._encode_subword(ts)
         if tt == tokenize.STRING:
-            return self._lookup("STRING")
+            token_id = self._lookup("STRING")
+            return [token_id] if token_id is not None else None
         if hasattr(tokenize, 'FSTRING_START') and tt == tokenize.FSTRING_START:
-            return self._lookup("FSTRING_START")
+            token_id = self._lookup("FSTRING_START")
+            return [token_id] if token_id is not None else None
         if tt == tokenize.NEWLINE:
-            return self._lookup("NEWLINE")
+            token_id = self._lookup("NEWLINE")
+            return [token_id] if token_id is not None else None
         if tt == tokenize.NL:
-            return self._lookup("NL")
+            token_id = self._lookup("NL")
+            return [token_id] if token_id is not None else None
         if tt == tokenize.INDENT:
-            return self._lookup("INDENT")
+            token_id = self._lookup("INDENT")
+            return [token_id] if token_id is not None else None
         if tt == tokenize.DEDENT:
-            return self._lookup("DEDENT")
+            token_id = self._lookup("DEDENT")
+            return [token_id] if token_id is not None else None
         if tt == tokenize.COMMENT:
             return self._encode_subword(ts)
         if hasattr(tokenize, 'TYPE_COMMENT') and tt == tokenize.TYPE_COMMENT:
-            return self._lookup("TYPE_COMMENT")
+            token_id = self._lookup("TYPE_COMMENT")
+            return [token_id] if token_id is not None else None
 
         # Operators
         if tt == tokenize.OP:
             op_name = self._map_op(ts)
-            return self._lookup(op_name) if op_name else None
+            if op_name:
+                token_id = self._lookup(op_name)
+                return [token_id] if token_id is not None else None
 
         return None
 
-    def _encode_subword(self, text: str) -> Optional[int]:
+    def _encode_subword(self, text: str) -> Optional[List[int]]:
         """
-        Apply BPE merges to text and return single token ID.
+        Apply BPE merges to text and return sequence of token IDs.
 
         For subword-able tokens (identifiers, numbers, comments):
-        1. Split into characters
+        1. Split into characters with word boundary marker
         2. Apply learned merges iteratively
-        3. Return first resulting token ID (or merged if still multiple)
+        3. Return sequence of token IDs from resulting pieces
 
-        NOTE: This is a simplification. In practice, we'd want to handle
-        multiple subword tokens per identifier. For now, we treat the entire
-        identifier as a single merged unit.
+        This preserves identifier information as a sequence of subword tokens.
         """
         if not text:
-            return self._lookup("<UNK>")
+            unk_id = self._lookup("<UNK>")
+            return [unk_id] if unk_id is not None else None
 
-        # Split into chars
+        # Split into chars with word-end marker
         tokens = list(text) + ["</w>"]
 
-        # Apply merges
-        for merge_pair in self.merges:
-            i = 0
-            while i < len(tokens) - 1:
-                if (tokens[i], tokens[i + 1]) == merge_pair:
-                    merged = tokens[i] + "##" + tokens[i + 1]
-                    tokens = tokens[:i] + [merged] + tokens[i + 2:]
-                    i += 1
-                else:
-                    i += 1
+        # Apply merges in order (by rank)
+        if self.merges:
+            for merge_pair in self.merges:
+                i = 0
+                while i < len(tokens) - 1:
+                    if (tokens[i], tokens[i + 1]) == merge_pair:
+                        # Merge preserves separators for clarity
+                        merged = tokens[i] + tokens[i + 1]
+                        tokens = tokens[:i] + [merged] + tokens[i + 2:]
+                        i += 1
+                    else:
+                        i += 1
 
-        # Join all tokens together (treating as a single "word" token)
-        # This is a pragmatic simplification: full BPE would return multiple IDs
-        merged_word = "".join(tokens).replace("</w>", "")
-        return self._lookup(merged_word)
+        # Convert each resulting token to ID
+        result_ids = []
+        for token in tokens:
+            token_id = self._lookup(token)
+            if token_id is not None:
+                result_ids.append(token_id)
+            else:
+                # Fallback: split on character boundary if merged token not in vocab
+                # This handles OOV subword pieces
+                result_ids.append(self._lookup("<UNK>"))
+
+        return result_ids if result_ids else None
 
     def _lookup(self, token: str) -> Optional[int]:
         """Look up token ID, return UNK_ID if not found."""
