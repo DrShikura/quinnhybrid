@@ -16,19 +16,30 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.tokenizer import PythonStructuralTokenizer
+from spectral.model.baseline_gpt import BaselineGPT
 from spectral.training.trainer import build_model
 from spectral.model.generate import generate, generate_beam
 
 
-def load_from_checkpoint(checkpoint_path: str):
+def load_from_checkpoint(checkpoint_path: str, model_override: str = 'auto'):
     ckpt      = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     config    = ckpt['config']
     tokenizer = PythonStructuralTokenizer()
-    model     = build_model(config, tokenizer.vocab)
+
+    model_type = (model_override if model_override != 'auto'
+                  else config.get('model_type', 'spectral'))
+
+    if model_type == 'spectral':
+        model = build_model(config, tokenizer.vocab)
+    else:
+        d, n = (64, 1) if model_type == 'baseline-1l' else (48, 2)
+        model = BaselineGPT(len(tokenizer.vocab), d_model=d, n_heads=4,
+                            n_layers=n, max_seq_len=config.get('max_seq_len', 256))
+
     model.load_state_dict(ckpt['model_state'])
     model.eval()
     counts = model.param_count()
-    print(f"Loaded: {checkpoint_path}")
+    print(f"Loaded: {checkpoint_path}  [{model_type}]")
     print(f"Parameters: {counts['total']:,}  |  val_loss: {ckpt.get('val_loss', '?'):.4f}")
     return model, tokenizer, config
 
@@ -36,6 +47,9 @@ def load_from_checkpoint(checkpoint_path: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--model',      default='auto',
+                        choices=['auto', 'spectral', 'baseline-1l', 'baseline-2l'],
+                        help='Model type (default: auto-detect from checkpoint)')
     parser.add_argument('--prompt',     default='def ')
     parser.add_argument('--max-new',    type=int,   default=100)
     parser.add_argument('--temperature',type=float, default=0.8)
@@ -60,7 +74,7 @@ def main():
         device = args.device
     print(f"Device: {device}")
 
-    model, tokenizer, config = load_from_checkpoint(args.checkpoint)
+    model, tokenizer, config = load_from_checkpoint(args.checkpoint, args.model)
 
     # Interpret common escape sequences so --prompt "import os\ndef " works
     # on Windows where the shell passes \n as a literal backslash-n.

@@ -114,6 +114,7 @@ def main():
             'memory_weight':     args.memory_weight,
             'band_weights':      [1.5, 1.0, 0.5],
             'weight_decay':      0.01,
+            'model_type':        args.model,
         }
 
     config['n_epochs'] = args.epochs
