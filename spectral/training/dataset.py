@@ -26,11 +26,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from data.tokenizer import PythonStructuralTokenizer
 
 
-def _corpus_cache_key(paths: List[Path], max_seq_len: int, min_seq_len: int) -> str:
+def _corpus_cache_key(paths: List[Path], max_seq_len: int, min_seq_len: int, vocab_size: int) -> str:
+    """Cache key includes vocab_size to invalidate when tokenizer changes."""
     h = hashlib.md5()
     for p in sorted(paths):
         h.update(str(p).encode())
-    h.update(f"{max_seq_len}:{min_seq_len}".encode())
+    h.update(f"{max_seq_len}:{min_seq_len}:{vocab_size}".encode())
     return h.hexdigest()[:16]
 
 
@@ -135,8 +136,10 @@ class SpectralDataset(Dataset):
             )
 
         # Disk cache for tokenized samples + spectral stats
+        # Vocab size included in cache key to invalidate on tokenizer changes
+        vocab_size = len(self.tokenizer.vocab)
         cache_dir  = Path("checkpoints") / ".dataset_cache"
-        cache_key  = _corpus_cache_key(paths, max_seq_len, min_seq_len)
+        cache_key  = _corpus_cache_key(paths, max_seq_len, min_seq_len, vocab_size)
         cache_file = cache_dir / f"{cache_key}.pt"
 
         if cache_file.exists():
@@ -159,7 +162,6 @@ class SpectralDataset(Dataset):
                     pass
 
             # Corpus-level spectral statistics — computed from ALL samples before split
-            vocab_size = len(self.tokenizer.vocab)
             self.laplacian_eigvecs, self.frozen_entropy = compute_spectral_stats(
                 all_samples, vocab_size
             )
