@@ -138,6 +138,10 @@ def main():
     model = build_model(config, tokenizer.vocab,
                         laplacian_eigvecs=laplacian_eigvecs)
 
+    if device.type == 'cuda' and hasattr(torch, 'compile'):
+        print("Compiling model with torch.compile(mode='reduce-overhead')...")
+        model = torch.compile(model, mode='reduce-overhead')
+
     trainer = SpectralTrainer(
         model          = model,
         train_loader   = train_dl,

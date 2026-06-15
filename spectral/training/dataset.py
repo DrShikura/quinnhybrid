@@ -12,6 +12,7 @@ Corpus-level statistics computed once from all tokenized files (before split):
                        gradient consistency loss (never updated during training).
 """
 
+import hashlib
 import math
 import random
 from pathlib import Path
@@ -23,6 +24,14 @@ from torch.utils.data import Dataset
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from data.tokenizer import PythonStructuralTokenizer
+
+
+def _corpus_cache_key(paths: List[Path], max_seq_len: int, min_seq_len: int) -> str:
+    h = hashlib.md5()
+    for p in sorted(paths):
+        h.update(str(p).encode())
+    h.update(f"{max_seq_len}:{min_seq_len}".encode())
+    return h.hexdigest()[:16]
 
 
 def compute_spectral_stats(
@@ -125,23 +134,43 @@ class SpectralDataset(Dataset):
                 f"or --corpus for a file-list .txt."
             )
 
-        # Tokenize all files
-        all_samples: List[List[int]] = []
-        for path in paths:
-            try:
-                source = path.read_text(encoding='utf-8', errors='replace')
-                ids    = self.tokenizer.encode(source, add_special=True)
-                if min_seq_len <= len(ids):
-                    ids = ids[:max_seq_len]
-                    all_samples.append(ids)
-            except Exception:
-                pass
+        # Disk cache for tokenized samples + spectral stats
+        cache_dir  = Path("checkpoints") / ".dataset_cache"
+        cache_key  = _corpus_cache_key(paths, max_seq_len, min_seq_len)
+        cache_file = cache_dir / f"{cache_key}.pt"
 
-        # Corpus-level spectral statistics — computed from ALL samples before split
-        vocab_size = len(self.tokenizer.vocab)
-        self.laplacian_eigvecs, self.frozen_entropy = compute_spectral_stats(
-            all_samples, vocab_size
-        )
+        if cache_file.exists():
+            print(f"  Loading dataset cache: {cache_key}")
+            cached = torch.load(cache_file, weights_only=False)
+            all_samples             = cached["samples"]
+            self.laplacian_eigvecs  = cached["laplacian_eigvecs"]
+            self.frozen_entropy     = cached["frozen_entropy"]
+        else:
+            # Tokenize all files
+            all_samples: List[List[int]] = []
+            for path in paths:
+                try:
+                    source = path.read_text(encoding='utf-8', errors='replace')
+                    ids    = self.tokenizer.encode(source, add_special=True)
+                    if min_seq_len <= len(ids):
+                        ids = ids[:max_seq_len]
+                        all_samples.append(ids)
+                except Exception:
+                    pass
+
+            # Corpus-level spectral statistics — computed from ALL samples before split
+            vocab_size = len(self.tokenizer.vocab)
+            self.laplacian_eigvecs, self.frozen_entropy = compute_spectral_stats(
+                all_samples, vocab_size
+            )
+
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "samples":           all_samples,
+                "laplacian_eigvecs": self.laplacian_eigvecs,
+                "frozen_entropy":    self.frozen_entropy,
+            }, cache_file)
+            print(f"  Saved dataset cache: {cache_key}")
 
         # Reproducible split
         rng = random.Random(seed)
