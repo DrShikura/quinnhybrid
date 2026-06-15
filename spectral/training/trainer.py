@@ -91,12 +91,15 @@ class SpectralTrainer:
             frozen_entropy.to(self.device) if frozen_entropy is not None else None
         )
 
-        # Loss
-        emb = model.embedding
+        # Loss — SpectralLoss band params only meaningful for SpectralLM
+        emb = getattr(model, 'embedding', None)
+        embed_dim      = getattr(model, 'embed_dim', getattr(model, 'd_model', 32))
+        structural_end = getattr(emb, 'structural_end', embed_dim // 4)
+        expr_end       = getattr(emb, 'expr_end',       embed_dim // 2)
         self.criterion = SpectralLoss(
-            embed_dim         = model.embed_dim,
-            structural_end    = emb.structural_end,
-            expr_end          = emb.expr_end,
+            embed_dim         = embed_dim,
+            structural_end    = structural_end,
+            expr_end          = expr_end,
             lm_weight         = config.get('lm_weight',        1.0),
             waveform_weight   = config.get('waveform_weight',  0.5),
             band_weights      = tuple(config.get('band_weights', [1.5, 1.0, 0.5])),
