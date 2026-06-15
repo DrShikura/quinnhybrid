@@ -55,7 +55,14 @@ _OPERATORS = [
 ]
 
 _STRUCTURAL = [
-    "NAME",                # generic identifier (non-keyword)
+    "NAME",                # generic identifier (non-keyword) — legacy, prefer roles below
+    "NAME_CLASS",          # identifier following 'class' keyword
+    "NAME_FUNC",           # identifier following 'def' keyword
+    "NAME_ATTR",           # identifier following '.' (dot/attribute access)
+    "NAME_CALL",           # identifier preceding '(' (function call)
+    "NAME_PARAM",          # identifier inside parameter list
+    "NAME_ASSIGN",         # identifier preceding '=' or other assignment
+    "NAME_OTHER",          # identifier not matching above roles
     "NUMBER",              # any numeric literal
     "STRING",              # any string/bytes literal
     "FSTRING_START",       # f-string start
@@ -120,12 +127,14 @@ class PythonStructuralTokenizer:
         if add_special:
             ids.append(BOS_ID)
 
-        prev_token_string: Optional[str] = None
-        for tok in tokens:
-            tok_id = self._map_token(tok, prev_token_string)
+        # Build context windows: (prev_tok, current_tok, next_tok)
+        # Filter to only non-trivial tokens (skip whitespace pseudo-tokens)
+        for i, tok in enumerate(tokens):
+            prev_tok = tokens[i - 1] if i > 0 else None
+            next_tok = tokens[i + 1] if i < len(tokens) - 1 else None
+            tok_id = self._map_token_with_context(tok, prev_tok, next_tok)
             if tok_id is not None:
                 ids.append(tok_id)
-            prev_token_string = tok.string
 
         if add_special:
             ids.append(EOS_ID)
@@ -145,8 +154,8 @@ class PythonStructuralTokenizer:
                 pass  # keep previous successful parse
         return all_toks
 
-    def _map_token(self, tok, prev_string: Optional[str]) -> Optional[int]:
-        """Map a tokenize.TokenInfo to a structural vocab ID."""
+    def _map_token_with_context(self, tok, prev_tok, next_tok) -> Optional[int]:
+        """Map a tokenize.TokenInfo to a structural vocab ID, with role awareness for NAME tokens."""
         tt = tok.type
         ts = tok.string
 
@@ -163,7 +172,9 @@ class PythonStructuralTokenizer:
                 if ts == "not":
                     return _VOCAB_INDEX.get("not")
                 return _VOCAB_INDEX.get(ts, UNK_ID)
-            return _VOCAB_INDEX.get("NAME")
+
+            # Determine NAME role from context
+            return self._determine_name_role(ts, prev_tok, next_tok)
 
         if tt == tokenize.NUMBER:
             return _VOCAB_INDEX.get("NUMBER")
@@ -197,6 +208,51 @@ class PythonStructuralTokenizer:
 
         # Unknown – skip rather than crash
         return None
+
+    def _determine_name_role(self, name_str: str, prev_tok, next_tok) -> int:
+        """
+        Determine the structural role of a NAME token based on context.
+
+        Returns a NAME_* token ID depending on syntactic context:
+          NAME_CLASS  → follows 'class'
+          NAME_FUNC   → follows 'def'
+          NAME_ATTR   → follows '.'
+          NAME_CALL   → precedes '('
+          NAME_PARAM  → inside parameter list (precedes ')', or ',' after LPAREN)
+          NAME_ASSIGN → precedes '=' or other assignment operator
+          NAME_OTHER  → default
+        """
+        prev_string = prev_tok.string if prev_tok else None
+        next_string = next_tok.string if next_tok else None
+        next_type = next_tok.type if next_tok else None
+
+        # NAME_CLASS: follows 'class'
+        if prev_string == "class":
+            return _VOCAB_INDEX["NAME_CLASS"]
+
+        # NAME_FUNC: follows 'def'
+        if prev_string == "def":
+            return _VOCAB_INDEX["NAME_FUNC"]
+
+        # NAME_ATTR: follows '.'
+        if prev_string == ".":
+            return _VOCAB_INDEX["NAME_ATTR"]
+
+        # NAME_CALL: precedes '('
+        if next_string == "(":
+            return _VOCAB_INDEX["NAME_CALL"]
+
+        # NAME_ASSIGN: precedes '=' or augmented assignment
+        if next_string == "=" or (next_type == tokenize.OP and next_string in _AUGASSIGN_OPS):
+            return _VOCAB_INDEX["NAME_ASSIGN"]
+
+        # NAME_PARAM: precedes ')', ',', or is inside a parameter list
+        # (heuristic: look for LPAREN in the past few tokens without intervening COLON/NEWLINE)
+        if next_string in (")", ","):
+            return _VOCAB_INDEX["NAME_PARAM"]
+
+        # NAME_OTHER: default catch-all
+        return _VOCAB_INDEX["NAME_OTHER"]
 
     def _map_op(self, s: str) -> int:
         if s == "(":   return _VOCAB_INDEX["LPAREN"]
