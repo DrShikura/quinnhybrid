@@ -16,32 +16,20 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.tokenizer import PythonStructuralTokenizer
-from spectral.model.spectral_lm import SpectralLM
+from spectral.training.trainer import build_model
 from spectral.model.generate import generate, generate_beam
 
 
 def load_from_checkpoint(checkpoint_path: str):
-    """Load model and config from checkpoint."""
-    ckpt = torch.load(checkpoint_path, map_location='cpu')
-    config = ckpt['config']
-
+    ckpt      = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    config    = ckpt['config']
     tokenizer = PythonStructuralTokenizer()
-
-    model = SpectralLM(
-        vocab       = tokenizer.vocab,
-        embed_dim   = config.get('embed_dim',   64),
-        n_layers    = config.get('n_layers',     4),
-        n_heads     = config.get('n_heads',      8),
-        max_seq_len = config.get('max_seq_len', 512),
-        dropout     = 0.0,
-    )
+    model     = build_model(config, tokenizer.vocab)
     model.load_state_dict(ckpt['model_state'])
     model.eval()
-
     counts = model.param_count()
     print(f"Loaded: {checkpoint_path}")
     print(f"Parameters: {counts['total']:,}  |  val_loss: {ckpt.get('val_loss', '?'):.4f}")
-
     return model, tokenizer, config
 
 
@@ -57,7 +45,20 @@ def main():
     parser.add_argument('--n-beams',    type=int,   default=4)
     parser.add_argument('--verbose',    action='store_true',
                         help='Print top-5 predictions at each generation step')
+    parser.add_argument('--device',     default='auto',
+                        choices=['auto', 'cpu', 'cuda', 'mps'])
     args = parser.parse_args()
+
+    if args.device == 'auto':
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
+    else:
+        device = args.device
+    print(f"Device: {device}")
 
     model, tokenizer, config = load_from_checkpoint(args.checkpoint)
 
@@ -74,6 +75,7 @@ def main():
             prompt   = prompt,
             max_new  = args.max_new,
             n_beams  = args.n_beams,
+            device   = device,
         )
     else:
         result = generate(
@@ -84,6 +86,7 @@ def main():
             top_k       = args.top_k,
             top_p       = args.top_p,
             verbose     = args.verbose,
+            device      = device,
         )
 
     print(result)
