@@ -16,6 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.tokenizer import PythonStructuralTokenizer
+from data.bpe_tokenizer import BytePairTokenizer
 from spectral.model.baseline_gpt import BaselineGPT
 from spectral.model.wave_gpt import WaveGPT
 from spectral.training.trainer import build_model
@@ -25,7 +26,19 @@ from spectral.model.generate import generate, generate_beam
 def load_from_checkpoint(checkpoint_path: str, model_override: str = 'auto'):
     ckpt      = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     config    = ckpt['config']
-    tokenizer = PythonStructuralTokenizer()
+
+    # Load appropriate tokenizer based on checkpoint config
+    tokenizer_type = config.get('tokenizer_type', 'structural')
+    if tokenizer_type == 'bpe':
+        bpe_vocab_path = config.get('tokenizer_vocab', 'data/bpe_vocab')
+        if Path(bpe_vocab_path).exists():
+            tokenizer = BytePairTokenizer(bpe_vocab_path)
+            print(f"Loaded BPE tokenizer from: {bpe_vocab_path}")
+        else:
+            print(f"Warning: BPE vocab not found at {bpe_vocab_path}, using structural tokenizer")
+            tokenizer = PythonStructuralTokenizer()
+    else:
+        tokenizer = PythonStructuralTokenizer()
 
     model_type = (model_override if model_override != 'auto'
                   else config.get('model_type', 'spectral'))

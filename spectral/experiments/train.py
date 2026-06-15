@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from data.tokenizer import PythonStructuralTokenizer
+from data.bpe_tokenizer import BytePairTokenizer
 from spectral.model.baseline_gpt import BaselineGPT
 from spectral.model.wave_gpt import WaveGPT
 from spectral.training.dataset import SpectralDataset, collate_fn
@@ -29,6 +30,11 @@ def main():
                         choices=['spectral', 'baseline-1l', 'baseline-2l', 'wave-gpt'],
                         help='spectral=SpectralLM (default), baseline-1l=GPT d=64 1-layer, '
                              'baseline-2l=GPT d=48 2-layer, wave-gpt=WaveGPT (ALiBi+phase)')
+    parser.add_argument('--tokenizer',    default='structural',
+                        choices=['structural', 'bpe'],
+                        help='structural=81-token roles (default), bpe=subword BPE encoding')
+    parser.add_argument('--bpe-vocab',    default='data/bpe_vocab',
+                        help='Path to trained BPE vocabulary (vocab.json + merges.txt)')
     parser.add_argument('--mode',        default='joint',
                         choices=['joint', 'lm', 'waveform'])
     parser.add_argument('--epochs',      type=int, default=50)
@@ -91,7 +97,18 @@ def main():
         device = torch.device(args.device)
     print(f"Device: {device}")
 
-    tokenizer = PythonStructuralTokenizer()
+    # Initialize tokenizer
+    if args.tokenizer == 'bpe':
+        bpe_path = Path(args.bpe_vocab)
+        if not bpe_path.exists():
+            print(f"Error: BPE vocab not found at {args.bpe_vocab}")
+            print(f"Train it first with: python train_bpe_vocab.py")
+            sys.exit(1)
+        tokenizer = BytePairTokenizer(str(bpe_path))
+        print(f"Loaded BPE tokenizer from: {args.bpe_vocab}")
+    else:
+        tokenizer = PythonStructuralTokenizer()
+        print(f"Using structural tokenizer (81-token vocab)")
 
     if args.resume:
         ckpt   = torch.load(args.resume, map_location='cpu')
@@ -121,6 +138,8 @@ def main():
             'weight_decay':      0.01,
             'model_type':        args.model,
             'ff_mult':           args.ff_mult,
+            'tokenizer_type':    args.tokenizer,
+            'tokenizer_vocab':   args.bpe_vocab if args.tokenizer == 'bpe' else None,
         }
 
     config['n_epochs'] = args.epochs
